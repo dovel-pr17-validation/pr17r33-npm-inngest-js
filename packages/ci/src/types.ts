@@ -1,0 +1,1122 @@
+/**
+ * The public types of `@inngest/ci`: configs, commands, caches, matrices and
+ * the trigger shapes. These double as the user docs in editor hovers, so every
+ * exported type says what it is for.
+ *
+ * @module
+ */
+
+import type { StandardSchemaV1 } from "@standard-schema/spec";
+import type { DurationInput, InngestFunction } from "inngest";
+import type { Image } from "./image.ts";
+
+/**
+ * A length of time: a number of milliseconds, an `ms` string like `"10m"`,
+ * `"24h"` or `"1h30m"`, or a `Temporal.Duration`.
+ */
+export type Duration = DurationInput;
+
+/**
+ * A trigger for a pipeline. This is an Inngest function trigger, so
+ * `{ cron: "0 3 * * *" }` and `{ event, if }` both work, plus a phantom type
+ * carrying the event data the trigger produces.
+ *
+ * `TData` never exists at runtime. It's what lets a handler know that
+ * `github.pullRequest()` means `event.data.pull_request` is there:
+ *
+ * ```ts
+ * ci.pipeline({ id: "pr", on: github.pullRequest() }, async ({ event }) => {
+ *   event.data.pull_request.head.sha; // string
+ * });
+ * ```
+ */
+export type CiTrigger<TData = unknown> = InngestFunction.Trigger<string> & {
+  /**
+   * The shape of `event.data` for this trigger. Phantom: it is never present
+   * at runtime, and never needs to be given.
+   *
+   * @internal
+   */
+  readonly __ciEventData?: TData;
+};
+
+/**
+ * What `ci.pipeline({ on })` accepts: one trigger, or any nesting of arrays of
+ * them, so `on: [github.pullRequest(), github.push()]` works.
+ */
+export type CiTriggerInput =
+  // biome-ignore lint/suspicious/noExplicitAny: matches a trigger of any payload
+  | CiTrigger<any>
+  // biome-ignore lint/suspicious/noExplicitAny: matches a trigger of any payload
+  | readonly (CiTrigger<any> | readonly CiTrigger<any>[])[];
+
+/**
+ * The event data a set of triggers produces, or `never` when none of them say.
+ */
+type PayloadOf<TTriggers> = TTriggers extends readonly (infer TTrigger)[]
+  ? PayloadOf<TTrigger>
+  : TTriggers extends { readonly __ciEventData?: infer TData }
+    ? // A trigger written by hand, like `{ cron }`, has no phantom, and infers
+      // `unknown`; that shouldn't swallow the payloads beside it in a union.
+      unknown extends TData
+      ? never
+      : TData
+    : never;
+
+/**
+ * `event.data` for a pipeline's handler: what its triggers say, or an open
+ * record when they don't say anything, as with a cron.
+ */
+export type EventDataOf<TTriggers> = [PayloadOf<TTriggers>] extends [never]
+  ? Record<string, unknown>
+  : PayloadOf<TTriggers>;
+
+/**
+ * An event as a pipeline handler sees it.
+ */
+export interface CiEvent<TData = Record<string, unknown>> {
+  /** The event's name, like `github-ci/pull_request.opened`. */
+  name: string;
+  /** The event's payload, typed by the pipeline's triggers. */
+  data: TData;
+  /** The event's ID, if it was sent with one. */
+  id?: string;
+  /** When the event happened, in milliseconds since the epoch. */
+  ts?: number;
+  /** The event's schema version, if it has one. */
+  v?: string;
+}
+
+/**
+ * The subset of `createFunction` options a pipeline passes through. These are
+ * taken from the existing function options rather than copied, so they stay in
+ * step with the SDK.
+ */
+export type FlowControlOptions = Pick<
+  InngestFunction.Options,
+  | "concurrency"
+  | "throttle"
+  | "rateLimit"
+  | "debounce"
+  | "priority"
+  | "singleton"
+  | "idempotency"
+  | "batchEvents"
+  | "timeouts"
+  | "cancelOn"
+  | "retries"
+  | "name"
+  | "description"
+>;
+
+/**
+ * Machine settings for a job.
+ */
+export interface MachineConfig {
+  /**
+   * The number of vCPUs the machine gets. Memory follows vCPU: 1 gets 1 GiB,
+   * 2 gets 2 GiB, 4 gets 4 GiB. Defaults to 4.
+   *
+   * Applies to machines created from scratch. A job that restores a snapshot
+   * from another job runs at that job's size.
+   */
+  vcpu?: 1 | 2 | 4;
+}
+
+/**
+ * Where a pipeline run came from, derived from the trigger event.
+ */
+export interface RepoContext {
+  /** The repository's owner, like `inngest`. */
+  owner: string;
+  /** The repository's name without the owner, like `inngest-js`. */
+  name: string;
+  /** The owner and name together, like `inngest/inngest-js`. */
+  fullName: string;
+  /** The PR head sha, push after sha, or merge group head sha. */
+  sha: string;
+  /** The branch or tag the run is for, like `refs/heads/main`. */
+  ref?: string;
+  /**
+   * The commit GitHub's test merge of a pull request made, which is what
+   * `checkout()` and `files()` use so the run tests the change as it would be
+   * merged. `sha` stays the head, which checks and statuses are posted on.
+   */
+  mergeSha?: string;
+  /** The commit the change is based on, for diffs. */
+  baseSha?: string;
+  /** The branch the change is based on, like `main`. */
+  baseRef?: string;
+  /** Set for pull request runs. `fork` is true when the head is another repo. */
+  pullRequest?: { number: number; headRef: string; fork: boolean };
+  /** The GitHub App installation the event came from, if any. */
+  installationId?: number;
+  /** Set by local fixtures, so `checkout()` can use the working tree. */
+  local?: { path: string; baseRef: string };
+  /** The name of the event that triggered the run, for check summaries. */
+  trigger?: string;
+}
+
+/**
+ * A part of a cache key that's resolved at runtime, like `files()`.
+ */
+export interface CacheKeyPart extends Readonly<FilesOptions> {
+  readonly kind: "inngest/ci.cacheKeyPart";
+  readonly type: "files";
+  readonly patterns: string[];
+}
+
+/** Where `files()` reads from, when that isn't the run's own commit. */
+export interface FilesOptions {
+  /** The repository to read the files from, as `owner/name`. Defaults to the run's. */
+  repo?: string;
+  /**
+   * The branch, tag or commit to read them at. Defaults to the run's commit, or
+   * to the repository's default branch when `repo` is another repository.
+   */
+  ref?: string;
+}
+
+/**
+ * One piece of a cache key: a string, a `files()` part, or a function that
+ * computes a string when the job runs.
+ */
+export type CacheKeyValue = CacheKeyPart | string | (() => Promise<string>);
+
+/**
+ * What a job's cache is keyed on: one piece, a list of pieces joined together,
+ * or an object of named pieces. The handler gets the named ones, resolved to
+ * strings, as `key`.
+ *
+ * ```ts
+ * key: [files("pnpm-lock.yaml"), async () => latestRelease("inngest/inngest")]
+ * key: { deps: files("pnpm-lock.yaml"), release: latestRelease }
+ * ```
+ */
+export type CacheKey =
+  | CacheKeyValue
+  | readonly CacheKeyValue[]
+  | { readonly [name: string]: CacheKeyValue };
+
+/** The named pieces of a cache key, resolved to strings: a handler's `key`. */
+export type KeyValues<TKey> = TKey extends CacheKeyValue | readonly unknown[]
+  ? Record<never, never>
+  : TKey extends object
+    ? { [K in keyof TKey]: string }
+    : Record<never, never>;
+
+/**
+ * A job's cache settings. `from` shares a job's machine within one run, and
+ * only a `cache` key reuses it across runs.
+ */
+export interface CacheConfig<TKey extends CacheKey | undefined = CacheKey> {
+  /**
+   * What the job depends on. If nothing in the key changed since the last
+   * successful run, the job is reused.
+   */
+  key?: TKey;
+
+  /**
+   * Triggers that rebuild the cache ahead of time, like a nightly cron, so
+   * pull requests don't pay for it.
+   */
+  refresh?: CiTrigger[];
+
+  /**
+   * Defaults to `"branch"`: PRs read from the default branch and write to
+   * their own scope.
+   */
+  scope?: "branch" | "global";
+
+  /**
+   * How old a cached snapshot may be before it is rebuilt, like `"1d"`. A
+   * snapshot older than this, counted from when it was taken, is a miss: the
+   * job builds again and the new snapshot takes the name.
+   *
+   * Without it a snapshot is reused until its key changes or it expires.
+   */
+  maxAge?: Duration;
+}
+
+/**
+ * A job's options, for when an ID on its own isn't enough.
+ *
+ * `TInput` is inferred from the handler, so a job that takes an input is
+ * written without any generics:
+ *
+ * ```ts
+ * const compat = ci.job("compat", async ({ input }: { input: string }) => {
+ *   await $`fnm use ${input}`;
+ * });
+ * ```
+ */
+export interface JobConfig<
+  TInput = void,
+  TKey extends CacheKey | undefined = CacheKey,
+  TFrom extends From<TInput> | undefined = From<TInput> | undefined,
+> {
+  /** Unique within the CI client. It's the job's check name, and its step IDs start with it. */
+  id: string;
+  /**
+   * The job to start from: this job runs on a copy of that job's machine, so
+   * it begins where the parent left off. The parent runs once however many
+   * jobs start from it.
+   *
+   * ```ts
+   * const install = ci.job("install", async () => {
+   *   await checkout();
+   *   await $`pnpm install`;
+   * });
+   *
+   * const test = ci.job({ id: "test", from: install }, async () => {
+   *   await $`pnpm test`;
+   * });
+   * ```
+   *
+   * A parent that takes input is given it with `job.with(input)`, and a
+   * parent can depend on this job's own input by passing a function:
+   *
+   * ```ts
+   * ci.job({ id: "web", from: build.with("web") }, …);
+   * ci.job({ id: "test", from: ({ input }) => build.with(input) }, …);
+   * ```
+   *
+   * To start from a job another app defines, use `image.job("app/job")`.
+   *
+   * A job or `job.with(input)` is checked when the app boots: it must be
+   * defined on this CI client, and its input must pass the parent's `input`
+   * schema (a schema that validates asynchronously is checked at run time).
+   * A function is checked when the job runs. A job that ends up starting from
+   * itself, through however many parents, fails with the cycle in its message.
+   *
+   * To choose a parent from facts only known at run time, define two jobs and
+   * choose between them in the pipeline.
+   */
+  from?: TFrom;
+  /** What the trace calls the job. Defaults to `id`. */
+  name?: string;
+  /**
+   * Machine settings for this job, overriding the pipeline's and the client's.
+   * Ignored when the job restores a snapshot from another job, which runs at
+   * that job's size.
+   */
+  machine?: MachineConfig;
+  /**
+   * Snapshot the job's machine when it passes, and reuse that snapshot while
+   * nothing in the key has changed: the job doesn't run again, and jobs that
+   * start `from` it start from the snapshot. A job that runs no commands has
+   * no machine, so it isn't cached.
+   */
+  cache?: CacheConfig<TKey>;
+  /** Check settings for this job. `false` means no job check. */
+  check?: false | { name?: string };
+  /**
+   * Snapshot the machine if the job fails, so you can start from where it
+   * broke. The snapshot ID is in the pipeline check's summary, under "Kept
+   * machines".
+   *
+   * The duration is currently ignored: the snapshot is kept for the
+   * platform's default retention, whatever you pass.
+   *
+   * Every other snapshot a run takes for `from` is deleted when the run
+   * ends, unless the job is cached. This one is kept.
+   */
+  keepOnFailure?: Duration;
+  /** Only a job defined with a `matrix` has one, so it never reaches the plain job types. */
+  matrix?: never;
+  /**
+   * The shape of the job's input, as any Standard Schema (Zod, Valibot,
+   * ArkType, …). The handler gets the validated value.
+   *
+   * A cached job, and a job another starts `from`, is built in a run of its
+   * own, which is sent the input you gave as JSON and validates it again. So
+   * the input you give must survive JSON. The cache key is built from the
+   * schema's output, so that must be plain JSON too (no `Date`, `Map`, `Set`
+   * or `bigint`). Transforms that normalise input, such as trim, lowercase or
+   * defaults, are fine, and let varied inputs share a key.
+   *
+   * ```ts
+   * const build = ci.job(
+   *   { id: "build", input: z.object({ target: z.enum(["web", "api"]) }) },
+   *   async ({ input }) => {
+   *     await $`pnpm build --target ${input.target}`;
+   *   },
+   * );
+   * ```
+   */
+  input?: StandardSchemaV1;
+}
+
+/** A JSON value. */
+export type JsonValue =
+  | string
+  | number
+  | boolean
+  | null
+  | JsonValue[]
+  | { [key: string]: JsonValue };
+
+/** One entry of a job's output: a JSON value, or a command to run later. */
+export type OutputValue = JsonValue | Command | undefined;
+
+/**
+ * What a job handler can return: nothing, or an object of JSON values and
+ * commands. `exitCode` is left out so that returning a bare command, which is
+ * awaited into its result, is a type error rather than an output.
+ */
+// biome-ignore lint/suspicious/noConfusingVoidType: a handler that returns nothing is `Promise<void>`
+export type JobOutput = void | {
+  [key: string]: OutputValue;
+  exitCode?: never;
+};
+
+/** The entries of an output that are data. */
+export type DataOf<TOutput> = {
+  [K in keyof TOutput as [Exclude<TOutput[K], Command>] extends [never]
+    ? never
+    : K]: Exclude<TOutput[K], Command>;
+};
+
+/**
+ * The entries of an output that are commands. An entry that is only sometimes a
+ * command, as when it can be `undefined`, is optional, because it is left out
+ * of what the job stored when it isn't one.
+ */
+export type CommandsOf<TOutput> = Merged<
+  {
+    [K in keyof TOutput as [TOutput[K]] extends [Command] ? K : never]: Extract<
+      TOutput[K],
+      Command
+    >;
+  } & {
+    [K in keyof TOutput as [Extract<TOutput[K], Command>] extends [never]
+      ? never
+      : [TOutput[K]] extends [Command]
+        ? never
+        : K]?: Extract<TOutput[K], Command>;
+  }
+>;
+
+type Merged<T> = { [K in keyof T]: T[K] };
+
+/**
+ * What awaiting a job gives: the data of its output. A job with a `cache` is
+ * built in a run of its own and may be reused, so it gives nothing.
+ */
+type Returned<TOutput, TCache> = [TCache] extends [undefined]
+  ? DataOrNothing<TOutput>
+  : Nothing;
+
+// biome-ignore lint/suspicious/noConfusingVoidType: a job that returns nothing resolves to `void`
+type Nothing = void;
+
+type DataOrNothing<TOutput> = [TOutput] extends [Nothing]
+  ? Nothing
+  : DataOf<TOutput>;
+
+/**
+ * A job: call it like a function.
+ *
+ * Every call is its own run of the job, with its own machine, steps and check:
+ * the second call in a pipeline run is `test (2)`. To share one run between
+ * jobs, start them `from` it, which builds the parent once.
+ *
+ * A job is called for its side effects, so it resolves to the data its handler
+ * returned, if any. A job with a `cache` is built in a run of its own and may
+ * be reused, so it resolves to nothing: read its output in a job that starts
+ * `from` it.
+ */
+export interface Job<
+  TInput = void,
+  TKey = unknown,
+  TFrom = unknown,
+  TOutput = void,
+  TCache = undefined,
+> {
+  (input: TInput): Promise<Returned<TOutput, TCache>>;
+  /** The job's ID, as given to `ci.job()`. */
+  readonly id: string;
+  readonly kind: "inngest/ci.job";
+  /**
+   * This job with an input, for another job to start `from`.
+   *
+   * ```ts
+   * ci.job({ id: "web", from: build.with("web") }, …);
+   * ```
+   */
+  with(input: TInput): JobRef<TInput, TKey, TFrom, TOutput>;
+  /**
+   * The job's input type, for type checks only: it's never set. It lets a
+   * bare `from: job` accept only a job that runs without input.
+   *
+   * @internal
+   */
+  readonly "~input"?: (input: TInput) => void;
+  /**
+   * The job's cache key, for type checks only: it's never set. It types the
+   * `from` and `image` of a job that starts from this one.
+   *
+   * @internal
+   */
+  readonly "~key"?: TKey;
+  /**
+   * What the job starts from, for type checks only: it's never set. It lets
+   * the `from.key` of a job below this one include the keys above it.
+   *
+   * @internal
+   */
+  readonly "~from"?: TFrom;
+  /**
+   * What the handler returns, for type checks only: it's never set. It types
+   * the `from.output` and `from.$` of a job that starts from this one.
+   *
+   * @internal
+   */
+  readonly "~output"?: TOutput;
+}
+
+/**
+ * A job with the input to run it with, from `job.with(input)`.
+ */
+export interface JobRef<
+  TInput = unknown,
+  TKey = unknown,
+  TFrom = unknown,
+  TOutput = void,
+> {
+  readonly kind: "inngest/ci.jobRef";
+  // biome-ignore lint/suspicious/noExplicitAny: a ref reads nothing of its job's cache
+  readonly job: Job<TInput, TKey, TFrom, TOutput, any>;
+  readonly input: TInput;
+}
+
+/**
+ * Any job with input, regardless of its input type.
+ */
+// biome-ignore lint/suspicious/noExplicitAny: matches any job's ref
+export type AnyJobRef = JobRef<any, any, any, any>;
+
+/**
+ * A job as `from` takes it bare: one that runs without input. A job that
+ * needs input is given it with `job.with(input)`. Without the call signature,
+ * a function given to `from` is typed as the function of input it is.
+ */
+type JobLike = Pick<AnyJob, "id" | "kind" | "with"> & {
+  readonly "~input"?: (input: undefined) => void;
+};
+
+/**
+ * What a job can start `from`: a job, a job with input, an `image`, or a
+ * function of the starting job's own input that gives any of them.
+ */
+export type From<TInput = void> =
+  | FromTarget
+  | ((ctx: {
+      /** The starting job's input. */
+      input: TInput;
+    }) => FromTarget);
+
+/** What `from` names: a job, a job with input, or an `image`. */
+export type FromTarget = JobLike | AnyJobRef | Image;
+
+/**
+ * Any job, regardless of its input type.
+ */
+// biome-ignore lint/suspicious/noExplicitAny: matches any job
+export type AnyJob = Job<any, any, any, any, any>;
+
+/** A job above another, with the named parts of its cache key resolved. */
+export interface Ancestor {
+  id: string;
+  key: Record<string, string>;
+}
+
+/** A job above the one running, with what it returned. */
+export interface AncestorContext extends Ancestor {
+  /** The data the job returned, as it was when its image was built. */
+  output: Record<string, unknown>;
+  /** The commands the job returned. */
+  $: Record<string, Command>;
+}
+
+/**
+ * What a job starts `from`, resolved: the image its machine is a copy of.
+ * Typed when the parent is a job defined in this app, and a record of strings
+ * for another app's image or a `from` function that could give either.
+ */
+export interface FromContext<
+  TKey = Record<string, string>,
+  TOutput = Record<string, OutputValue>,
+> {
+  /** The ID of the job it starts from. */
+  id: string;
+  /**
+   * The named key parts of everything the image was built from, flattened
+   * through its ancestors. The nearest one wins a shared name.
+   */
+  key: TKey;
+  /**
+   * The data everything the image was built from returned, flattened through
+   * its ancestors. The nearest one wins a shared name. It describes the image
+   * as it was built, so a cached image gives the same output every time.
+   * Commands are in `$`.
+   */
+  output: DataOf<TOutput>;
+  /**
+   * The commands everything the image was built from returned, flattened like
+   * `output`, to run on this job's machine. They are commands, not processes:
+   * nothing the jobs above started is running here.
+   *
+   * Write `from.$.devServer` rather than destructuring: `const { $ } = from`
+   * would shadow the `$` you import, and `from.$.x` says where a command
+   * comes from.
+   *
+   * ```ts
+   * await from.$.devServer.background();
+   * ```
+   */
+  $: CommandsOf<TOutput>;
+  /** Each job above, nearest first, with its own key parts and output, for exact lookups. */
+  ancestry: AncestorContext[];
+}
+
+/**
+ * What a job without a `from` has as its `TFrom`: a function that gives
+ * nothing. It is a function so that a `from` function written in the config is
+ * typed by its parameter, and it gives `never` so that no parent is named.
+ */
+export type NoFrom<TInput> = (ctx: { input: TInput }) => never;
+
+/** What `from` names, with a function replaced by what it gives. */
+type TargetOf<TFrom> = TFrom extends {
+  kind: "inngest/ci.job" | "inngest/ci.jobRef" | "inngest/ci.image";
+}
+  ? TFrom
+  : TFrom extends (ctx: never) => infer TResult
+    ? Exclude<TResult, undefined>
+    : Exclude<TFrom, undefined>;
+
+/**
+ * The named key parts of everything a `from` names, flattened up the chain
+ * with the nearest job winning a shared name. Omitting the shadowed names from
+ * the parents' keys, rather than intersecting, keeps each part's own type and
+ * the JSDoc on its declaration.
+ */
+type KeysOf<TFrom> = [TargetOf<TFrom>] extends [never]
+  ? unknown
+  : KeysOfTarget<TargetOf<TFrom>>;
+
+type KeysOfTarget<TTarget> = TTarget extends { kind: "inngest/ci.job" }
+  ? TTarget extends {
+      readonly "~key"?: infer TKey;
+      readonly "~from"?: infer TUp;
+    }
+    ? Omit<KeysOf<TUp>, keyof KeyValues<TKey>> & KeyValues<TKey>
+    : unknown
+  : TTarget extends { kind: "inngest/ci.jobRef"; job: infer TJob }
+    ? KeysOf<TJob>
+    : Record<string, string>;
+
+/**
+ * The outputs of everything a `from` names, flattened like `KeysOf`. A job's
+ * output replaces the same name above it, whether it is data or a command.
+ */
+type OutputsOf<TFrom> = [TargetOf<TFrom>] extends [never]
+  ? unknown
+  : OutputsOfTarget<TargetOf<TFrom>>;
+
+type OutputsOfTarget<TTarget> = TTarget extends { kind: "inngest/ci.job" }
+  ? TTarget extends {
+      readonly "~output"?: infer TOutput;
+      readonly "~from"?: infer TUp;
+    }
+    ? Omit<OutputsOf<TUp>, keyof TOutput> & TOutput
+    : unknown
+  : TTarget extends { kind: "inngest/ci.jobRef"; job: infer TJob }
+    ? OutputsOf<TJob>
+    : Record<string, OutputValue>;
+
+type ParentOf<TFrom> = [TargetOf<TFrom>] extends [never]
+  ? undefined
+  : FromContext<KeysOf<TFrom>, OutputsOf<TFrom>>;
+
+/**
+ * Why a cached job is running instead of being reused: `"miss"` when no
+ * usable snapshot was found, `"refresh"` when its `cache.refresh` trigger
+ * started it, and `"rebuild"` when it replaces a snapshot that wouldn't
+ * start. A job without a `cache` has none.
+ */
+export type CacheReason = "miss" | "refresh" | "rebuild";
+
+/**
+ * What a job handler is given.
+ *
+ * ```ts
+ * ci.job(
+ *   { id: "test", from: base, cache: { key: { deps: files("pnpm-lock.yaml") } } },
+ *   async ({ key, from }) => {
+ *     key.deps; // what this job's cache key was made of
+ *     from.key; // the named key parts of the image it started from
+ *   },
+ * );
+ * ```
+ */
+export interface JobContext<
+  TInput = void,
+  TKey = undefined,
+  TFrom = undefined,
+> {
+  /** The job's ID, with the combination for a matrix job. */
+  id: string;
+  /** The named parts of the job's `cache.key`, resolved to strings. */
+  key: KeyValues<TKey>;
+  /** Why the job is running, when it has a `cache`. */
+  cache: CacheReason | undefined;
+  /** The job's input, validated by its `input` schema. */
+  input: TInput;
+  /** The job it starts `from`, resolved. `undefined` without a `from`. */
+  from: ParentOf<TFrom>;
+  /** The repository and change this run is for, as the pipeline's `repo`. */
+  repo: RepoContext | undefined;
+  /** The Inngest run the job is in. */
+  run: {
+    /** The pipeline run's ID, as it appears in the trace. */
+    id: string;
+  };
+}
+
+/**
+ * What the handler of a job with a `matrix` is given: a job's context, and the combination.
+ *
+ * ```ts
+ * ci.job({ id: "compat", matrix: { axes: { node: ["20", "22"] } } }, async ({ matrix }) => {
+ *   await $`fnm use ${matrix.node}`;
+ * });
+ * ```
+ */
+export interface MatrixContext<
+  TAxes extends MatrixAxes = MatrixAxes,
+  TKey = Record<string, string>,
+  TFrom = FromTarget | undefined,
+> extends JobContext<void, TKey, TFrom> {
+  /** This job's combination of the axes. */
+  matrix: MatrixCombo<TAxes>;
+}
+
+/**
+ * A pipeline's options. Every flow control option `createFunction` takes works
+ * here too, so `singleton`, `idempotency`, `concurrency`, `throttle`,
+ * `debounce`, `rateLimit`, `priority`, `batchEvents`, `timeouts`, `cancelOn`,
+ * and `retries` are all available.
+ *
+ * ```ts
+ * ci.pipeline(
+ *   {
+ *     id: "pr",
+ *     on: github.pullRequest(),
+ *     // a new push to the same pull request cancels the run in progress
+ *     singleton: { key: "event.data.pull_request.number", mode: "cancel" },
+ *   },
+ *   async () => { … },
+ * );
+ * ```
+ */
+export interface PipelineConfig<
+  TTriggers extends CiTriggerInput = CiTriggerInput,
+> extends FlowControlOptions {
+  /** Unique within the app. It names the function, the run, and the check. */
+  id: string;
+  /** What starts this pipeline. Pass an array for several triggers. */
+  on: TTriggers;
+  /**
+   * Check settings. `false` turns off all checks for this pipeline, and
+   * `{ jobs: false }` keeps the pipeline check but drops the per-job ones.
+   */
+  check?: false | { name?: string; jobs?: boolean };
+  /** Default machine for this pipeline's jobs. */
+  machine?: MachineConfig;
+  /**
+   * Whether each job runs as a run of its own, with its own step budget,
+   * retries and trace. Cancelling or ending the pipeline cancels them.
+   * Defaults to `true`; `false` runs jobs in the pipeline's run, which
+   * has one step budget for them all.
+   *
+   * A job defined inside the pipeline, or with `keepOnFailure`, runs in the
+   * pipeline's run either way. A job with a `cache` always runs as a run of its
+   * own, since that run decides whether to reuse its snapshot or build it.
+   */
+  childRuns?: boolean;
+  /**
+   * For triggers with no repo of their own, like crons, the `owner/repo` to
+   * resolve a head commit from.
+   */
+  repo?: string;
+  /**
+   * Set from `github.comment({ minPermission })` triggers, one per command.
+   * CEL can't ask GitHub whether someone is allowed, so the run checks the
+   * permission of the command that matched and reports "Not permitted"
+   * instead.
+   *
+   * @internal
+   */
+  commentPermissions?: {
+    command: string;
+    minPermission: "read" | "triage" | "write" | "maintain" | "admin";
+  }[];
+}
+
+/**
+ * What a pipeline handler is given.
+ *
+ * `event` is typed by the pipeline's triggers, so a pipeline on
+ * `github.pullRequest()` can read `event.data.pull_request` without a cast.
+ */
+export interface PipelineContext<
+  TTriggers extends CiTriggerInput = CiTriggerInput,
+> {
+  /** The event that started this run. */
+  event: CiEvent<EventDataOf<TTriggers>>;
+  /** Every event in the batch, when `batchEvents` is on. Otherwise just the one. */
+  events: CiEvent<EventDataOf<TTriggers>>[];
+  /** This run's ID, as it appears in the trace. */
+  runId: string;
+  /** The pipeline's ID, as given to `ci.pipeline()`. */
+  pipelineId: string;
+  /**
+   * The repository this run is for, derived from the trigger. `undefined` for
+   * triggers that don't carry one, like a cron with no `repo` set.
+   */
+  repo: RepoContext | undefined;
+  /** Which attempt of this run this is, counting from 0. */
+  attempt: number;
+  /** The run's logger, which writes into the trace. */
+  logger: {
+    info(...args: unknown[]): void;
+    warn(...args: unknown[]): void;
+    error(...args: unknown[]): void;
+    debug(...args: unknown[]): void;
+  };
+}
+
+/**
+ * Returned from a pipeline handler to end the run early with a reason shown on
+ * the check.
+ */
+export interface CiSkip {
+  readonly kind: "inngest/ci.skip";
+  readonly reason: string;
+}
+
+/**
+ * What a finished command gives you.
+ */
+export interface CommandResult {
+  /** Zero unless something went wrong. A non-zero code throws unless `.nothrow()`. */
+  exitCode: number;
+  /** The last 64 KiB of stdout. */
+  stdout: string;
+  /** The last 64 KiB of stderr. */
+  stderr: string;
+  /** Whether output was cut to fit. The whole of it is on the machine. */
+  truncated: boolean;
+  /**
+   * Both streams in the order they were written, for a command that ran as a
+   * process. A command that ran as one step reports them apart only.
+   */
+  merged?: string;
+  /**
+   * How long the command ran, from the machine's own timestamps. Missing when
+   * the Sandbox API doesn't report them, which today is commands with a
+   * timeout of 5 minutes or less.
+   */
+  durationMs?: number;
+}
+
+/**
+ * A command started with `.background()`, still running.
+ */
+export interface BackgroundProcess {
+  /** The process ID on the machine. */
+  readonly id: string;
+  /** Wait for it to exit, and read its result. */
+  exited(): Promise<CommandResult>;
+  /** Signal it. Defaults to 15 (`SIGTERM`). */
+  kill(signal?: number): Promise<void>;
+  /** Read what it has printed so far. */
+  output(opts?: { tailBytes?: number }): Promise<string>;
+}
+
+/**
+ * What can be interpolated into a command.
+ *
+ * Each value becomes one argument, arrays spread into several, and `null`,
+ * `undefined`, and `false` are dropped, so `${cond && ["--flag", x]}` works.
+ */
+export type CommandValue =
+  | string
+  | number
+  | boolean
+  | readonly (string | number)[]
+  | null
+  | undefined;
+
+/**
+ * A command, lazy until it's awaited.
+ *
+ * Every option returns the command, so they chain:
+ *
+ * ```ts
+ * await $`pnpm test`.env({ CI: "true" }).retries(1).timeout("10m");
+ * ```
+ */
+export interface Command extends PromiseLike<CommandResult> {
+  /** Environment variables for this command, over the job's defaults. */
+  env(vars: Record<string, string>): Command;
+  /** Where to run, on the machine. Defaults to `/work` after `checkout()`. */
+  cwd(path: string): Command;
+  /**
+   * Give the command a readable label, which becomes its step name.
+   *
+   * ```ts
+   * await $`pnpm exec playwright test --project=chromium`.as("e2e: chromium");
+   * ```
+   */
+  as(name: string): Command;
+  /**
+   * Run it again if it fails, up to `count` more times.
+   *
+   * Each attempt is its own step, so the check and the trace show which
+   * attempt this is and why the last one failed. Retries land on the same
+   * machine.
+   */
+  retries(count: number): Command;
+  /**
+   * Return the result with its non-zero exit code instead of throwing, for
+   * when a failure is information rather than an error.
+   *
+   * ```ts
+   * const { exitCode } = await $`pnpm lint`.nothrow();
+   * ```
+   */
+  nothrow(): Command;
+  /**
+   * Give up after this long, and throw `CommandTimeoutError`.
+   *
+   * A timeout under five minutes also makes the command a single captured
+   * step, which is cheaper and keeps the trace tidy.
+   */
+  timeout(duration: Duration): Command;
+  /**
+   * Run this before the command is killed by its timeout, for a last look at
+   * what it was doing.
+   *
+   * ```ts
+   * await $`pnpm test`.timeout("10m").onTimeout(() => $`ps auxf`);
+   * ```
+   */
+  onTimeout(fn: () => Promise<unknown>): Command;
+  /**
+   * Start the command and keep it running while the job continues.
+   *
+   * ```ts
+   * const server = await $`pnpm start`.background();
+   * await waitForPort(3000);
+   * // …
+   * await server.kill();
+   * ```
+   *
+   * Note: there are no process exit events yet, so `exited()` polls rather
+   * than waiting on one.
+   */
+  background(): Promise<BackgroundProcess>;
+  /**
+   * Not supported yet: running a command with a secret. The Sandbox API has
+   * no per-command secrets, and values passed as command environment are
+   * persisted in step data. Calling this throws `CiUsageError` and never sends
+   * the value anywhere.
+   *
+   * @deprecated Don't use this until secrets are supported.
+   */
+  withSecret(name: string, value: string): Command;
+  /** Run it and return stdout, trimmed. */
+  text(): Promise<string>;
+  /** Run it and return stdout's lines, with no trailing blank. */
+  lines(): Promise<string[]>;
+  /** Run it and parse stdout as JSON. */
+  json<T = unknown>(): Promise<T>;
+}
+
+/**
+ * The `$` tag itself: a template tag that builds a {@link Command}.
+ */
+export type CommandTag = (
+  strings: TemplateStringsArray,
+  ...values: CommandValue[]
+) => Command;
+
+/**
+ * A second machine for a job, like a database to test against. Commands run on
+ * it, not on the job's own machine.
+ */
+export interface ExtraMachine {
+  /** The name it was given, unique within the job. */
+  readonly name: string;
+  /** Run a command on this machine. `$.sh` runs a shell script. */
+  $: CommandTag & { sh: CommandTag };
+  /** Wait until something listens on `port`, or throw after `timeout`. */
+  waitForPort(port: number, opts?: { timeout?: Duration }): Promise<void>;
+  /** Wait until `url` answers (with `status`, if given), or throw after `timeout`. */
+  waitForHttp(
+    url: string,
+    opts?: { timeout?: Duration; status?: number },
+  ): Promise<void>;
+}
+
+/**
+ * The axes a matrix runs over: a name, and the values to try.
+ */
+export type MatrixAxes = Record<
+  string,
+  readonly (string | number | boolean | null)[]
+>;
+
+/**
+ * What a job's `matrix.axes` function is given: what is known before any job runs.
+ */
+export interface MatrixAxesContext {
+  /** The repository and change this run is for, as the pipeline's `repo`. */
+  repo: RepoContext | undefined;
+  /** The Inngest run the matrix is in. */
+  run: { id: string };
+}
+
+/**
+ * One combination of a matrix's axes.
+ *
+ * Values keep their literal types, so a handler's `combo.node` is
+ * `"20" | "22"` rather than `string`, and a typo in `exclude` is a type error.
+ */
+export type MatrixCombo<TAxes> = {
+  [K in keyof TAxes]: TAxes[K] extends readonly (infer TValue)[]
+    ? TValue
+    : never;
+};
+
+/**
+ * A job's `matrix`: the axes to run it over, and how to run the combinations.
+ */
+export interface MatrixOptions<TAxes extends MatrixAxes = MatrixAxes> {
+  /**
+   * The axes to combine, in the order they should appear in job IDs. A function
+   * is called once per run, in a step, and its result is what every
+   * combination is made from, so the axes can depend on the commit being
+   * tested, and its values must be strings, numbers, booleans or null. A job a
+   * combination starts from, or runs as, is handed the combination and never
+   * calls it again.
+   */
+  axes: TAxes | ((ctx: MatrixAxesContext) => TAxes | Promise<TAxes>);
+  /** Combinations to leave out. A partial combination excludes every match. */
+  exclude?: readonly Partial<MatrixCombo<TAxes>>[];
+  /** Extra combinations to add, beyond the product of the axes. */
+  include?: readonly MatrixCombo<TAxes>[];
+  /** How many combinations may run at once. Defaults to all of them. */
+  concurrency?: number;
+  /**
+   * Stop the rest when one fails. Off by default, so one bad combination
+   * doesn't hide the others' failures.
+   */
+  failFast?: boolean;
+}
+
+/**
+ * The options of a job with a `matrix`.
+ *
+ * ```ts
+ * const compat = ci.job(
+ *   {
+ *     id: "compat",
+ *     matrix: {
+ *       axes: { node: ["20", "22", "24"], db: ["sqlite", "postgres"] },
+ *       exclude: [{ node: "20", db: "postgres" }],
+ *       concurrency: 3,
+ *     },
+ *   },
+ *   async ({ matrix }) => {
+ *     await $`pnpm test`.env({
+ *       NODE_VERSION: matrix.node,
+ *       TEST_DATABASE: matrix.db,
+ *     });
+ *   },
+ * );
+ * ```
+ */
+export interface MatrixJobConfig<
+  TAxes extends MatrixAxes = MatrixAxes,
+  TFrom extends From<MatrixCombo<TAxes>> | undefined =
+    | From<MatrixCombo<TAxes>>
+    | undefined,
+> {
+  /** Unique within the CI client. Each combination's job ID starts with it. */
+  id: string;
+  /** What to run the job over. Its combinations are each a job. */
+  matrix: MatrixOptions<TAxes>;
+  /** Machine settings, per combination if you need them to differ. */
+  machine?: MachineConfig | ((combo: MatrixCombo<TAxes>) => MachineConfig);
+  /** Cache settings, per combination if you need them to differ. */
+  cache?: CacheConfig | ((combo: MatrixCombo<TAxes>) => CacheConfig);
+  /**
+   * The job each combination starts `from`. A function is given the
+   * combination as its `input`.
+   */
+  from?: TFrom;
+  /** Check settings for each combination's job. `false` means no job checks. */
+  check?: false | { name?: string };
+}
+
+/**
+ * A job with a matrix: call it to run every combination, or pass part of a combination to
+ * run only what matches.
+ *
+ * ```ts
+ * await compat();                               // every combination
+ * await compat({ node: "22" });                 // just the Node 22 ones
+ * await compat({ node: "22", db: "postgres" }); // just the one
+ * ```
+ */
+export interface MatrixJob<TAxes extends MatrixAxes> {
+  (only?: Partial<MatrixCombo<TAxes>>): Promise<void>;
+  /** The job's ID, as given to `ci.job()`. */
+  readonly id: string;
+}
+
+/**
+ * How a check ended, as GitHub names it.
+ */
+export type CheckConclusion =
+  | "success"
+  | "failure"
+  | "neutral"
+  | "cancelled"
+  | "timed_out"
+  | "action_required"
+  | "skipped"
+  | "stale";
+
+/**
+ * A note on a line of a file, shown on the check and in the pull request diff.
+ */
+export interface CheckAnnotation {
+  /** The file, relative to the repository root. */
+  path: string;
+  /** Shorthand for `start_line` and `end_line`. */
+  line?: number;
+  start_line?: number;
+  end_line?: number;
+  annotation_level?: "notice" | "warning" | "failure";
+  /** What to say about the line. */
+  message: string;
+  /** A short heading for the annotation. */
+  title?: string;
+  /** Longer details, shown when the annotation is expanded. */
+  raw_details?: string;
+}

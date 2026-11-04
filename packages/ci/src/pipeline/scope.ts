@@ -1,0 +1,809 @@
+/**
+ * The run and job scopes held in async context: what a running pipeline or
+ * job knows about itself, and the helpers that read them.
+ *
+ * @module
+ */
+
+import type { GetStepTools, Inngest, InngestFunction } from "inngest";
+import type { AsyncContext, DurableSandboxTools } from "inngest/experimental";
+import { getAsyncCtx, runWithAsyncCtx } from "inngest/experimental";
+import type { CachedSnapshot, CacheTarget } from "../cache/cache.ts";
+import { buildEntryOf } from "../cache/names.ts";
+import { CiUsageError } from "../errors.ts";
+import type { CommandRow } from "../github/render/commands.ts";
+import type { ResolvedSource } from "../github/source.ts";
+import type { CommandState } from "../machine/command.ts";
+import type { Found } from "../report/found.ts";
+import type {
+  CheckAnnotation,
+  CheckConclusion,
+  JobConfig,
+  MachineConfig,
+  MatrixAxes,
+  RepoContext,
+} from "../types.ts";
+import type { CacheBuildData, CacheBuildResult } from "./cacheBuild.ts";
+import type { CiHooks } from "./hooks.ts";
+import type { RegisteredJob } from "./job.ts";
+import { spans } from "./names.ts";
+import { inSpan } from "./spans.ts";
+
+/**
+ * The separator used between parts of a scope path and a step label. It's a
+ * single character that never appears in job IDs in practice, so paths stay
+ * readable in the trace.
+ */
+export const scopeSeparator = " › ";
+
+/** A step ID built from parts, as in `test › machine › setup`. */
+export const joinId = (...parts: string[]): string => {
+  return parts.join(scopeSeparator);
+};
+
+/** What a rebuilt job's path adds to its ID, as in `base (rebuild)`. */
+export const rebuildSuffix = " (rebuild)";
+
+/** The default working directory, which is where `checkout()` puts the repo. */
+export const defaultCwd = "/work";
+
+/**
+ * The local working tree this run reads, when it has one. A run with local
+ * repository data still talks to GitHub when `INNGEST_CI_GITHUB=live`.
+ */
+export const localRepo = (
+  run: Pick<CiRunScope, "repo">,
+): NonNullable<RepoContext["local"]> | undefined => {
+  if (process.env.INNGEST_CI_GITHUB === "live") {
+    return undefined;
+  }
+
+  return run.repo?.local;
+};
+
+/**
+ * Where a matrix combination's job config remembers the matrix and combination
+ * it came from, so its snapshot is built by the matrix's build function.
+ */
+export const matrixOriginKey = Symbol("inngest/ci.matrixOrigin");
+
+/** The matrix and combination a job was expanded from, if it was. */
+export const matrixOriginOf = (
+  config: JobConfig,
+): { id: string; combo: Record<string, unknown> } | undefined => {
+  return (
+    config as unknown as {
+      [matrixOriginKey]?: { id: string; combo: Record<string, unknown> };
+    }
+  )[matrixOriginKey];
+};
+
+/**
+ * Where a job config remembers it was defined while a run was active, so it
+ * exists only in the memory of the worker running that pipeline. A matrix sets
+ * it on its combinations itself, since they are always defined in a run.
+ */
+export const inlineKey = Symbol("inngest/ci.inline");
+
+/** Whether the job was defined inside a pipeline run. */
+export const isInline = (config: JobConfig): boolean => {
+  return (config as unknown as { [inlineKey]?: boolean })[inlineKey] === true;
+};
+
+/**
+ * What a job is asked to build, whether by the build function's run or by the
+ * run that defined it: where its snapshot goes, what to do about the name, what
+ * it starts from, and where it leaves what it ended with.
+ */
+export interface BuildRequest {
+  /** The key and snapshot name to build under. */
+  target: CacheTarget;
+  /** A snapshot that wouldn't start, which the build must not reuse. */
+  exclude?: string;
+  /** Whether `exclude` was decided to be broken, so the build may delete it. */
+  broken?: boolean;
+  /** Whether the build leaves the name alone and takes a snapshot of its own. */
+  unnamed?: boolean;
+  /** Whether nothing starts from the job, so the build takes no snapshot. */
+  direct?: boolean;
+  /** What the job starts from, as a build is handed it. */
+  base?: CacheBuildResult;
+  /** What the job leaves for whoever asked: the job sets it, they read it. */
+  sink: {
+    /** What the job ended with. */
+    outcome?: BuildOutcome;
+    /** The job's line in the summary, for the asker to report. */
+    summary?: JobSummary;
+    /** The data the job returned, which is what a direct call resolves to. */
+    output?: Record<string, unknown>;
+  };
+}
+
+/**
+ * A machine held by a job or an extra machine scope. It's a promise so
+ * concurrent first commands share one creation.
+ */
+export interface MachineHandle {
+  /** The durable sandbox, as returned by `step.sandbox.create`. */
+  // biome-ignore lint/suspicious/noExplicitAny: DurableSandbox, kept loose to avoid a cycle
+  sandbox: any;
+  name: string;
+  id: string;
+  /**
+   * Processes this run has already started on the machine, so reconciling an
+   * ambiguous start never adopts one of them.
+   */
+  claimedProcessIds?: Set<string>;
+}
+
+/** What the ID of a function that refreshes a cached job starts with. */
+export const cacheRefreshIdPrefix = "ci/cache-refresh/";
+
+/** What a build run is asked to build, from the data it was invoked with. */
+export const requestOf = (data: CacheBuildData): BuildRequest => {
+  return {
+    target: {
+      ownKey: data.ownKey,
+      key: data.key ?? {},
+      entry: buildEntryOf(data),
+    },
+    ...(data.exclude ? { exclude: data.exclude } : {}),
+    ...(data.broken ? { broken: data.broken } : {}),
+    ...(data.unnamed ? { unnamed: data.unnamed } : {}),
+    ...(data.direct ? { direct: data.direct } : {}),
+    ...(data.base ? { base: data.base } : {}),
+    sink: {},
+  };
+};
+
+/** What a built job ended with, which the asker takes as its own. */
+export interface BuildOutcome {
+  /** The job's snapshot, if it had a machine and snapshots could be taken. */
+  snapshotId?: string;
+  /** Set when the snapshot is the job's cache entry, found or made. */
+  cached?: CachedSnapshot;
+  /** Whether the snapshot was already there, rather than built by this run. */
+  reused: boolean;
+}
+
+/** What a build records in its machine, for the jobs that start from it. */
+export interface BuildInfo {
+  /** How long the job took to build, in milliseconds. */
+  durationMs: number;
+  /** When the snapshot was taken, as an ISO timestamp. */
+  createdAt: string;
+}
+
+/** What a job records about itself in the run, for the pipeline's check. */
+export interface JobNode {
+  /** The job's path, which is its ID for the first call of a job. */
+  path: string;
+  /** The jobs it starts from. */
+  parents: string[];
+  state: "queued" | "running" | "ok" | "cached" | "failed" | "stopped";
+  /** When it started and ended, as the clock read inside its check's steps. */
+  startedAt?: number;
+  endedAt?: number;
+  /** Whether it is making a cache entry, or made one. */
+  building?: boolean;
+  built?: boolean;
+  /** The ID of its check on GitHub. */
+  checkRunId?: number;
+  /** Why it failed, when it did. */
+  failure?: { why: string; infra: boolean; stepUrl?: string };
+  /** How many annotations its check carries. */
+  annotations?: number;
+}
+
+export interface JobSummary {
+  path: string;
+  conclusion: CheckConclusion;
+  title: string;
+  durationMs: number;
+  /** Set when the job was restored from cache. */
+  cached?: boolean;
+  /** Set when `keepOnFailure` snapshotted the machine. */
+  keptSnapshotId?: string;
+}
+
+/**
+ * Everything a run needs from the CI client, without importing `createCi` and
+ * making a cycle.
+ */
+export interface CiInternals {
+  /** Reports checks to GitHub, the console, or nowhere. */
+  // biome-ignore lint/suspicious/noExplicitAny: CheckReporter, kept loose to avoid a cycle
+  checks: any;
+  // biome-ignore lint/suspicious/noExplicitAny: GitHubProvider, kept loose to avoid a cycle
+  github: any;
+  /** Every job defined on the client, so a job's `from` can find its parent. */
+  jobs: Map<
+    string,
+    {
+      config: JobConfig;
+      // biome-ignore lint/suspicious/noExplicitAny: user handler
+      handler: (input: any) => Promise<unknown>;
+    }
+  >;
+  defaultMachine?: { vcpu?: 1 | 2 | 4 };
+  runUrl: (ctx: { runId: string; functionId: string }) => string;
+  /** What the run tells a tool that watches it. Does nothing by default. */
+  hooks: CiHooks;
+  // biome-ignore lint/suspicious/noExplicitAny: Inngest.Any
+  client: any;
+  /**
+   * The one function that builds the snapshot of any job, or of a matrix's
+   * combinations, in a run of its own. Which one is in the invoke's data.
+   */
+  cacheBuild: () => InngestFunction.Any;
+  isDev: () => boolean;
+  // biome-ignore lint/suspicious/noExplicitAny: any logger-ish
+  logger?: { warn: (...args: any[]) => void };
+}
+
+/**
+ * The public APIs counted in run metadata. Each is counted where it's called,
+ * so the counts say which parts of `@inngest/ci` a run used.
+ */
+export const apiNames = [
+  "from",
+  "matrix",
+  "cache",
+  "sandbox",
+  "checkout",
+  "changed",
+  "report",
+  "githubRest",
+  "githubHelpers",
+  "waitForChecks",
+  "waitForWorkflow",
+  "waitFor",
+  "commands",
+  "background",
+  "shard",
+  "skip",
+] as const;
+
+export type ApiName = (typeof apiNames)[number];
+
+export interface CiRunScope {
+  ci: CiInternals;
+  runId: string;
+  functionId: string;
+  pipelineId: string;
+  /** The pipeline check's name. `undefined` when checks are off. */
+  checkName?: string;
+  jobChecks: boolean;
+  /** The pipeline's default machine, for jobs that set none. */
+  machine?: MachineConfig;
+  /** Whether jobs run in runs of their own, as `PipelineConfig.childRuns` says. */
+  childRuns: boolean;
+  event: unknown;
+  /**
+   * Whether a re-run from a GitHub check asked to build without the cache.
+   * Read from the trigger event, so it is the same on every request.
+   */
+  noCache?: boolean;
+  repo?: RepoContext;
+  /**
+   * The builds `from` has asked for, keyed by request: the parent's job ID
+   * (with its input, when it has one), or the same plus `(rebuild)` for a
+   * snapshot that went bad. Each is the one `step.invoke()` of the parent's
+   * build, so children of one parent share it. It holds promises and nothing
+   * else, and no job reads another job's state through it.
+   */
+  builds: Map<string, Promise<CacheBuildResult>>;
+  /**
+   * The repositories and refs `checkout()` and `files()` have resolved to a
+   * commit, keyed by repository and ref, so each is resolved by one step per
+   * run. It holds promises and nothing else.
+   */
+  sources: Map<string, Promise<ResolvedSource>>;
+  /**
+   * The axes of the matrices whose `axes` is a function, keyed by matrix ID,
+   * so each is resolved by one step per run. It holds promises and nothing
+   * else.
+   */
+  matrixAxes: Map<string, Promise<MatrixAxes>>;
+  /** The IDs of the jobs defined in this run, which must be unique. */
+  definedJobs: Set<string>;
+  /**
+   * The jobs defined in this run, which no other run can see. The client's
+   * registry is shared by every run on the worker, so two overlapping runs
+   * defining one ID would build each other's job.
+   */
+  inlineJobs: Map<string, RegisteredJob>;
+  /** How many direct calls of each job have started, keyed by job ID. */
+  jobCalls: Map<string, number>;
+  /**
+   * Snapshots the builds this run asked for left for it, by ID: a `from`
+   * parent's without a `cache`, and the unnamed fallback of any build. They are
+   * deleted when the run ends. A named cache snapshot is never added, so later
+   * runs find it.
+   */
+  createdSnapshots: Set<string>;
+  /**
+   * The IDs of the machines this run created, which it destroys when it ends.
+   * It only ever destroys what it holds the ID of.
+   */
+  createdMachines: Set<string>;
+  /**
+   * Set when this run is a build: one job's snapshot, built for the run that
+   * invoked it. It has no checks of its own and reports to that run.
+   */
+  build?: CacheBuildData;
+  /** What a build run is asked to build, from `build`. */
+  request?: BuildRequest;
+  /**
+   * Set while this build run answers for the lock on its cache entry: the lock
+   * machine's name, and the path of the job that claims it. The run tells the
+   * runs waiting on the lock how it ended. Cleared when another build holds it.
+   */
+  buildLock?: { name: string; path: string };
+  /** What the build's job reported, which the build hands back. */
+  report?: {
+    summaries: string[];
+    annotations: CheckAnnotation[];
+    commands: CommandRow[];
+    found: Found[];
+  };
+  /** Job results in call order, for the pipeline check summary. */
+  summaries: JobSummary[];
+  /**
+   * What each job has recorded about itself, by path, for the pipeline's check.
+   * Jobs write it as they go; only the check's steps read it.
+   */
+  jobGraph: Map<string, JobNode>;
+  /**
+   * Job checks that have started and not finished. When a run ends while jobs
+   * are still going, these are completed rather than left spinning.
+   */
+  openChecks: Map<string, string | undefined>;
+  /**
+   * How long each reused snapshot took to build, by the ID of the job that made
+   * it, for what the run saved from cache. Write-only for jobs, read once the
+   * run is over.
+   */
+  cacheSaved: Map<string, number>;
+  /**
+   * When the run started, for how long it took by the clock. Write-once, and
+   * only read inside the step that completes the pipeline.
+   */
+  startedAt?: number;
+  /** This attempt, counting from 0. */
+  attempt: number;
+  /** How many attempts Inngest makes in all. */
+  maxAttempts: number;
+  /** Whether Inngest will run the function again after this error. */
+  willRetry: (error: unknown) => boolean;
+  /** Raw step tools for CI's own steps. IDs are written in full. */
+  step: GetStepTools<Inngest.Any>;
+  sandboxTools: DurableSandboxTools;
+  /** The SDK async context this run is nested in. */
+  asyncCtx: AsyncContext;
+  /** Step ID counters, keyed by the ID's base. */
+  counters: Map<string, number>;
+  /** Warnings to surface on the pipeline check. */
+  warnings: string[];
+  /** The run's changed files, read once; `null` when they can't be read. */
+  changedFiles?: Promise<string[] | null>;
+  /** Markdown added with `report.summary()` outside a job. */
+  pipelineSummaries: string[];
+  /** Annotations added with `report.annotate()` outside a job. */
+  pipelineAnnotations: CheckAnnotation[];
+  /** How many times each public API was called in this run. */
+  apis: Record<ApiName, number>;
+}
+
+/** What one job returned: its JSON data, and its commands as their state. */
+export interface StoredOutput {
+  data: Record<string, unknown>;
+  commands: Record<string, CommandState>;
+}
+
+/**
+ * What jobs returned, by their place in the chain and ID. The place keeps two
+ * jobs of the same ID, as when one app's `build` starts from another's, apart.
+ */
+export type StoredOutputs = Record<string, StoredOutput>;
+
+export interface CiJobScope {
+  run: CiRunScope;
+  /** The job's path, which is its ID for a job and `${job} › ${name}` for an extra machine. */
+  path: string;
+  /** The owning job's path. Same as `path` unless this is an extra machine. */
+  jobPath: string;
+  config: JobConfig;
+  machine?: Promise<MachineHandle>;
+  /** Set when the job builds a snapshot for someone who asked for it. */
+  request?: BuildRequest;
+  /**
+   * Set when the job has a check of its own, with its name if it was given
+   * one. A job without it shows nothing on GitHub.
+   */
+  check?: { name?: string };
+  fromSnapshotId?: string;
+  /** The job this one starts from, and whether its snapshot was made before this run. */
+  fromParent?: { id: string; reused: boolean };
+  /** Re-runs the `from` parent on this job's machine. Set by `startFrom`. */
+  rebuildParent?: () => Promise<void>;
+  /**
+   * Asks for the `from` parent's snapshot to be built again, once per run
+   * whatever the number of children that need it, and gives the new one. Set
+   * by `startFrom`.
+   *
+   * With `broken`, the snapshot failed to start twice, so it is deleted first
+   * (once, whichever child asks). With `unnamed`, the rebuild leaves the name
+   * alone, as when another build is still taking the snapshot.
+   */
+  rebuildSnapshot?: (why: {
+    broken: boolean;
+    unnamed: boolean;
+  }) => Promise<string | undefined>;
+  /**
+   * `rebuildParent`, once the snapshot wouldn't start and a fresh machine
+   * has to be brought to where the snapshot would have been.
+   */
+  restoreFallback?: () => Promise<void>;
+  /** What the job's first machine is for, shown while it starts. */
+  startNote?: string;
+  /** The one run of `restoreFallback`, which every other command waits on. */
+  fallbackRan?: Promise<void>;
+  fromJobIds: string[];
+  /** When the job started, as its check read it. Set once it has. */
+  startedAt?: number;
+  /**
+   * The commands that have started or finished in this job, in the order they
+   * started, for its check. An extra machine shares its job's list.
+   */
+  commands: CommandRow[];
+  /** What tools reported about the code, as paths in the repository. */
+  found: Found[];
+  annotations: CheckAnnotation[];
+  /** Extra summary markdown added with `report.summary`. */
+  summaries: string[];
+  /** Environment defaults for commands in this scope. */
+  env: Record<string, string>;
+  cwd?: string;
+  /**
+   * Variables a command unset, so that later commands start without them.
+   * `env` and `cwd` move as commands `export` and `cd`, like a shell.
+   */
+  unset: Set<string>;
+  /** Secret values to mask in output. */
+  secrets: string[];
+  /**
+   * What the jobs on this machine's chain returned, by job ID, as stored: the
+   * machine's outputs file, plus what ran here since.
+   */
+  outputs: StoredOutputs;
+  /** What the outputs file held when it was last read or written. */
+  savedOutputs: string;
+  /** Extra machines created in this job with `sandbox()`, keyed by name. */
+  extras?: Map<string, CiJobScope>;
+}
+
+interface CiStore {
+  run?: CiRunScope;
+  job?: CiJobScope;
+  /** The job whose `restoreFallback` is running here. Its commands don't wait on it. */
+  restoring?: CiJobScope;
+}
+
+type CiAls = {
+  getStore(): CiStore | undefined;
+  run<R>(store: CiStore, fn: () => R): R;
+};
+
+const fallbackAls: CiAls = {
+  getStore: () => {
+    return undefined;
+  },
+  run: (_store, fn) => {
+    return fn();
+  },
+};
+
+let resolvedAls: CiAls | undefined;
+let alsPromise: Promise<CiAls> | undefined;
+
+/**
+ * CI keeps its own async local storage, nested inside the SDK's. It's loaded
+ * lazily so importing `inngest/ci` doesn't require `node:async_hooks`.
+ */
+export const initCiAls = async (): Promise<CiAls> => {
+  if (resolvedAls) {
+    return resolvedAls;
+  }
+
+  alsPromise ??= (async () => {
+    try {
+      const { AsyncLocalStorage } = await import("node:async_hooks");
+
+      resolvedAls = new AsyncLocalStorage<CiStore>();
+    } catch {
+      resolvedAls = fallbackAls;
+    }
+
+    return resolvedAls;
+  })();
+
+  return alsPromise;
+};
+
+const getStore = (): CiStore | undefined => {
+  return resolvedAls?.getStore();
+};
+
+/**
+ * The ID of the pipeline run at the root: this run, or for a build run, the
+ * root it was invoked with. It travels in the invoke data, never in shared
+ * memory.
+ */
+export const rootRunIdOf = (run: CiRunScope): string => {
+  return run.build?.rootRunId ?? run.runId;
+};
+
+export const getRunScope = (): CiRunScope | undefined => {
+  return getStore()?.run;
+};
+export const getJobScope = (): CiJobScope | undefined => {
+  return getStore()?.job;
+};
+
+/** Whether this code is part of `scope`'s `restoreFallback`. */
+export const isRestoring = (scope: CiJobScope): boolean => {
+  return getStore()?.restoring === scope;
+};
+
+/**
+ * Count a call to a public API in the current run, for run metadata. Outside a
+ * run there's nothing to count into.
+ */
+export const countApi = (api: ApiName): void => {
+  const run = getRunScope();
+
+  if (run) {
+    run.apis[api] += 1;
+  }
+};
+
+export const runInScope = <R>(store: CiStore, fn: () => R): R => {
+  return (resolvedAls ?? fallbackAls).run(store, fn);
+};
+
+/**
+ * Return the current job scope, or throw a message explaining what to do.
+ */
+export const requireJobScope = (api: string): CiJobScope => {
+  const job = getJobScope();
+
+  if (!job) {
+    if (getRunScope()) {
+      throw new CiUsageError(
+        `\`${api}\` was called outside a job, so there's no machine to run it on. Wrap it in \`ci.job()\`.`,
+      );
+    }
+
+    throw new CiUsageError(
+      `\`${api}\` was called outside a pipeline run. Call it from a job inside \`ci.pipeline()\`.`,
+    );
+  }
+
+  return job;
+};
+
+export const requireRunScope = (api: string): CiRunScope => {
+  const run = getRunScope();
+
+  if (!run) {
+    throw new CiUsageError(
+      `\`${api}\` was called outside a pipeline run. Call it from inside \`ci.pipeline()\`.`,
+    );
+  }
+
+  return run;
+};
+
+/**
+ * Build a step ID for a scope, adding ` #n` from the second use of the same
+ * label onwards. This is deterministic because handler code is.
+ */
+export const nextStepId = (
+  run: CiRunScope,
+  scopePath: string | undefined,
+  label: string,
+): string => {
+  const base = scopePath ? joinId(scopePath, label) : label;
+  const seen = (run.counters.get(base) ?? 0) + 1;
+
+  run.counters.set(base, seen);
+
+  return seen === 1 ? base : `${base} #${seen}`;
+};
+
+/**
+ * Wrap step tools so every ID they're given is prefixed with a scope path, and
+ * so the CI scope is still there inside the handler.
+ *
+ * User code inside a job writes `step.run("create-db", …)`, and the ID that
+ * reaches the executor is `test › create-db`, so two jobs can use the same
+ * name.
+ *
+ * The scope part matters because the execution engine calls step handlers from
+ * its own context rather than the caller's, so without this a `github.rest`
+ * call inside `step.run` couldn't tell which run it belonged to.
+ */
+export const withStepIdPrefix = <T extends object>(
+  tools: T,
+  prefix?: string,
+): T => {
+  const cache = new Map<string | symbol, unknown>();
+
+  return new Proxy(tools, {
+    get(target, prop, receiver) {
+      if (cache.has(prop)) {
+        return cache.get(prop);
+      }
+
+      const value = Reflect.get(target, prop, receiver) as unknown;
+
+      if (typeof value === "function") {
+        const wrapped = (...args: unknown[]) => {
+          const [idOrOptions, ...rest] = args;
+          const store = getStore();
+
+          return (value as (...a: unknown[]) => unknown).apply(target, [
+            prefix === undefined
+              ? idOrOptions
+              : prefixStepId(idOrOptions, prefix),
+            ...rest.map((arg) => {
+              return typeof arg === "function"
+                ? inScope(store, arg as (...args: unknown[]) => unknown)
+                : arg;
+            }),
+          ]);
+        };
+
+        cache.set(prop, wrapped);
+
+        return wrapped;
+      }
+
+      if (value && typeof value === "object") {
+        const wrapped = withStepIdPrefix(value as object, prefix);
+
+        cache.set(prop, wrapped);
+
+        return wrapped;
+      }
+
+      return value;
+    },
+  });
+};
+
+/**
+ * Re-enter a scope for a callback the engine will run later, from its own
+ * context.
+ */
+const inScope = (
+  store: CiStore | undefined,
+  // biome-ignore lint/suspicious/noExplicitAny: any step handler
+  fn: (...args: any[]) => unknown,
+  // biome-ignore lint/suspicious/noExplicitAny: any step handler
+): ((...args: any[]) => unknown) => {
+  return store
+    ? (...args) => {
+        return runInScope(store, () => {
+          return fn(...args);
+        });
+      }
+    : fn;
+};
+
+/**
+ * Step tools that keep the CI scope alive inside their handlers, without
+ * touching IDs. CI's own steps write their IDs out in full.
+ */
+export const withScopePreserved = <T extends object>(tools: T): T => {
+  return withStepIdPrefix(tools);
+};
+
+/**
+ * Prefix a step's ID with its scope path, and name it by the ID it was given,
+ * since its job's span already shows the rest.
+ */
+const prefixStepId = (idOrOptions: unknown, prefix: string): unknown => {
+  if (typeof idOrOptions === "string") {
+    return {
+      id: joinId(prefix, idOrOptions),
+      name: idOrOptions,
+    };
+  }
+
+  if (
+    idOrOptions &&
+    typeof idOrOptions === "object" &&
+    "id" in idOrOptions &&
+    typeof (idOrOptions as { id: unknown }).id === "string"
+  ) {
+    const opts = idOrOptions as { id: string; name?: string };
+
+    return {
+      ...opts,
+      id: joinId(prefix, opts.id),
+      name: opts.name ?? opts.id,
+    };
+  }
+
+  return idOrOptions;
+};
+
+/**
+ * Run `fn` in a job's trace span. The span is top-level wherever the job is
+ * started from, so work on its machine that another job asks for later, like
+ * a snapshot, comes back to it.
+ */
+export const inJobSpan = <R>(
+  run: CiRunScope,
+  config: JobConfig,
+  jobPath: string,
+  fn: () => R,
+): R => {
+  return runWithAsyncCtx(run.asyncCtx, () => {
+    return inSpan(spans.job(config, jobPath), fn);
+  });
+};
+
+/**
+ * Run `fn` outside every job's span, wherever it's called from. Jobs that
+ * start from one parent share its build, so the build's steps belong to none
+ * of them, and which one asks first must not decide where they sit in the
+ * trace.
+ */
+export const outsideJobs = <R>(run: CiRunScope, fn: () => R): R => {
+  return runWithAsyncCtx(run.asyncCtx, fn);
+};
+
+/**
+ * Run `fn` in the run's one top-level GitHub span, wherever it's called from.
+ * Reporting isn't a job's own work, so a job's span ends with the job, and a
+ * failed job doesn't end on a green check update.
+ */
+export const inGitHubSpan = <R>(run: CiRunScope, fn: () => R): R => {
+  return runWithAsyncCtx(run.asyncCtx, () => {
+    return inSpan(spans.github(), fn);
+  });
+};
+
+/**
+ * Run a job handler inside both the CI job scope and a copy of the SDK's async
+ * context whose `step` prefixes IDs with the job path. It copies the context
+ * `inJobSpan` set, so the handler's steps are in the job's span.
+ */
+export const runJobBody = async <R>(
+  scope: CiJobScope,
+  fn: () => Promise<R>,
+): Promise<R> => {
+  const asyncCtx = await getAsyncCtx();
+
+  if (!asyncCtx?.execution) {
+    return runInScope({ run: scope.run, job: scope }, fn);
+  }
+
+  const scopedCtx: AsyncContext = {
+    ...asyncCtx,
+    execution: {
+      ...asyncCtx.execution,
+      ctx: {
+        ...asyncCtx.execution.ctx,
+        step: withStepIdPrefix(asyncCtx.execution.ctx.step, scope.path),
+      },
+    },
+  };
+
+  return runWithAsyncCtx(scopedCtx, () => {
+    return runInScope({ run: scope.run, job: scope }, fn);
+  });
+};

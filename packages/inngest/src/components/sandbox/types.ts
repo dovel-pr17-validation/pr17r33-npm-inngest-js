@@ -1,0 +1,802 @@
+import type { DurationLike } from "../../helpers/temporal.ts";
+import type { StepOptionsOrId } from "../../types.ts";
+import type { SandboxDollar } from "./dollar.ts";
+import type { SandboxImage } from "./image.ts";
+import type {
+  SandboxShell,
+  SandboxShellOptions,
+  ShellSession,
+} from "./shell.ts";
+import type { SandboxToolsOptions } from "./tools.ts";
+
+export const sandboxProtocolVersion = 1 as const;
+
+export type SandboxDuration = number | string | DurationLike;
+
+export type SandboxStatus =
+  | "PENDING"
+  | "STARTING"
+  | "PAUSING"
+  | "RUNNING"
+  | "PAUSED"
+  | "RESUMING"
+  | "TERMINATING"
+  | "TERMINATED"
+  | "FAILED";
+
+export interface SandboxResources {
+  readonly vcpu: number;
+  readonly memoryMb: number;
+}
+
+export interface SandboxResource {
+  id: string;
+  name: string;
+  status: SandboxStatus;
+  vpcId: string;
+  imageRef: string;
+  /** Pinned launch artifact (`sha256:<hex>`), absent for legacy sandboxes. */
+  imageDigest?: string;
+  resources: SandboxResources;
+  createdAt: string;
+  startedAt?: string;
+  endedAt?: string;
+  error?: string;
+}
+
+export interface SandboxRef extends SandboxResource {
+  kind: "inngest/sandbox";
+  version: 1;
+}
+
+interface SandboxCreateBaseOptions {
+  /**
+   * Stable identity for an active sandbox. Creating the same name again with
+   * the same configuration returns the existing sandbox. Names are
+   * case-sensitive and may contain up to 255 characters.
+   */
+  name: string;
+
+  /**
+   * How long to wait for the sandbox to reach RUNNING after Create succeeds.
+   *
+   * Defaults to 120 seconds. Set this to `false` to return as soon as Create is
+   * accepted, with either STARTING or RUNNING status.
+   *
+   * @example
+   * ```ts
+   * const sandbox = await inngest.sandboxes.create({
+   *   ...options,
+   *   runningTimeout: "30s",
+   * });
+   * ```
+   *
+   * @example Return immediately without waiting
+   * ```ts
+   * const sandbox = await inngest.sandboxes.create({
+   *   ...options,
+   *   runningTimeout: false,
+   * });
+   * ```
+   */
+  runningTimeout?: SandboxDuration | false;
+}
+
+export interface SandboxCreateFreshOptions extends SandboxCreateBaseOptions {
+  vcpu: number;
+  memoryMb: number;
+
+  /**
+   * An already-published image accessible to this workspace, such as
+   * `inngest/base:latest`, `my-image:v1`, `my-image@sha256:<hex>`, or
+   * `sha256:<hex>`. A name without a tag uses latest. Omit this to use the
+   * default base image. This does not build or upload an image.
+   *
+   * Resolved once for a new sandbox. Retrying the same name and configuration
+   * returns its original image, even if the tag has moved. Use a new sandbox
+   * name to pick up an updated tag. Cannot be combined with snapshotId.
+   */
+  image?: string;
+
+  /**
+   * The image to start from: `image.inngest("base")` (the default) or
+   * `image.custom(ref)`. Cannot be combined with `image` or snapshotId.
+   */
+  from?: SandboxImage;
+
+  /**
+   * Literal environment inherited by commands and managed processes. Values
+   * are persisted as sandbox configuration. Use `secrets` for workspace secret
+   * references. Guest defaults are retained, and operation-specific values
+   * override matching keys.
+   */
+  environment?: Record<string, string>;
+
+  /**
+   * Exact workspace secret names, each injected under that same environment
+   * variable name, e.g. `["OPENAI_API_KEY"]`. Save the secret as OPENAI_API_KEY
+   * to make it available under that name. Names are resolved once when
+   * creating the sandbox; create retries keep the original secret identities.
+   * Archiving and recreating a name affects only new sandboxes. Selected
+   * values are fetched at launch with short-lived authorization and inherited
+   * by commands and managed processes. Delivered values remain in snapshots.
+   * Names must be unique, valid environment keys, and must not overlap with
+   * environment. Selection order does not affect sandbox identity.
+   */
+  secrets?: string[];
+
+  snapshotId?: never;
+}
+
+export interface SandboxCreateFromSnapshotOptions
+  extends SandboxCreateBaseOptions {
+  snapshotId: string;
+  image?: never;
+  from?: never;
+  vcpu?: never;
+  memoryMb?: never;
+  environment?: never;
+  secrets?: never;
+}
+
+export type SandboxCreateOptions =
+  | SandboxCreateFreshOptions
+  | SandboxCreateFromSnapshotOptions;
+
+export interface SandboxWaitUntilRunningOptions {
+  timeout: SandboxDuration;
+}
+
+export interface SandboxListOptions {
+  cursor?: string;
+  limit?: number;
+}
+
+export interface SandboxPageInfo {
+  cursor?: string;
+  hasMore: boolean;
+  limit: number;
+}
+
+export interface SandboxListResult<TSandbox = SandboxRef> {
+  items: TSandbox[];
+  page: SandboxPageInfo;
+  fetchedAt: string;
+}
+
+/**
+ * A shell command string or an argv array for direct execution.
+ *
+ * Strings run as `["/bin/sh", "-c", command]`. They are passed to the shell
+ * unchanged, so normal shell quoting, variables, pipes, redirects, and
+ * chaining apply. Arrays bypass the shell: the first item is the program, a
+ * bare name such as `pnpm` (found on the sandbox's `PATH`) or a path.
+ */
+export type SandboxCommand = string | readonly string[];
+
+export interface SandboxCommandOptions {
+  /**
+   * Overrides matching sandbox environment values for this command.
+   * Omitted or empty inherits the sandbox environment unchanged.
+   */
+  environment?: Record<string, string>;
+  cwd?: string;
+  timeout?: SandboxDuration;
+  /**
+   * @internal Set by `sandbox.shell()`: what the command reads as in errors,
+   * and how to take its session report off stdout before the exit is judged.
+   */
+  "~shell"?: { text: string; strip: (stdout: string) => string };
+}
+
+/**
+ * The exit codes a command may end with: a list, or `"any"` for all of them.
+ */
+export type SandboxExitCodes = readonly number[] | "any";
+
+export type SandboxCommandOutputMetadata =
+  | {
+      truncated: false;
+    }
+  | {
+      truncated: true;
+      strategy: "tail";
+      /**
+       * Left out when the command ran as a process (a `timeout` over five
+       * minutes), whose output is a 512 KiB tail with no original size.
+       */
+      originalBytes?: {
+        stdout: number;
+        stderr: number;
+      };
+      retainedBytes: {
+        stdout: number;
+        stderr: number;
+      };
+    };
+
+export interface SandboxCommandResult {
+  /**
+   * Captured stdout decoded as UTF-8. Invalid or truncated byte sequences are
+   * represented by the Unicode replacement character.
+   */
+  stdout: string;
+  /**
+   * Captured stderr decoded as UTF-8. Invalid or truncated byte sequences are
+   * represented by the Unicode replacement character.
+   */
+  stderr: string;
+  exitCode: number;
+  output: SandboxCommandOutputMetadata;
+}
+
+export type SandboxDestroyResult =
+  | {
+      status: "TERMINATING";
+      sandbox: SandboxRef;
+    }
+  | {
+      status: "TERMINATED";
+      sandbox: null;
+    };
+
+export type SandboxProcessState =
+  | "STARTING"
+  | "RUNNING"
+  | "EXITED"
+  | "KILLED"
+  | "FAILED"
+  | "LOST";
+
+export interface SandboxProcessResource {
+  id: string;
+  command: readonly string[];
+  pid?: number;
+  state: SandboxProcessState;
+  exitCode?: number;
+  terminationSignal?: number;
+  startedAt?: string;
+  endedAt?: string;
+}
+
+export interface SandboxProcessRef extends SandboxProcessResource {
+  kind: "inngest/sandbox.process";
+  version: 1;
+  sandboxId: string;
+}
+
+export interface SandboxProcessStartOptions {
+  command: SandboxCommand;
+
+  /**
+   * Overrides matching sandbox environment values for this process.
+   * Omitted or empty inherits the sandbox environment unchanged.
+   */
+  environment?: Record<string, string>;
+  cwd?: string;
+}
+
+export interface SandboxProcessSignalOptions {
+  signal: number;
+  /**
+   * Also signal the process's descendants. Defaults to `true` so shell-backed
+   * commands do not leave their child processes running.
+   */
+  includeChildren?: boolean;
+}
+
+export interface SandboxProcessWaitOptions {
+  timeout?: SandboxDuration;
+}
+
+export interface SandboxProcessOutputOptions {
+  tailBytes?: number;
+}
+
+export type SandboxProcessListOptions = SandboxListOptions;
+export type SandboxProcessListResult<TProcess = SandboxProcessRef> =
+  SandboxListResult<TProcess>;
+
+export interface SandboxOutputChunk {
+  stream: "STDOUT" | "STDERR";
+  data: Uint8Array;
+  at?: string;
+}
+
+export interface SandboxProcessOutput {
+  chunks: SandboxOutputChunk[];
+}
+
+export interface SandboxLogStreamOptions {
+  follow?: boolean;
+}
+
+export interface SandboxFileUploadOptions {
+  path: string;
+  data: BodyInit;
+  mode?: number;
+}
+
+export interface SandboxFileUploadResult {
+  path: string;
+  bytesWritten: number;
+}
+
+export interface SandboxFileDownloadOptions {
+  path: string;
+}
+
+export type SandboxSnapshotStatus =
+  | "CREATING"
+  | "READY"
+  | "DELETING"
+  | "DELETED"
+  | "FAILED"
+  | "LOST";
+
+export interface SandboxSnapshotResource {
+  id: string;
+  /**
+   * The name given when the snapshot was created, if any.
+   */
+  name?: string;
+  sourceImageId: string;
+  status: SandboxSnapshotStatus;
+  compatibilityId?: string;
+  resources: SandboxResources;
+  memoryPackCount: number;
+  diskPackCount: number;
+  storedBytes: number;
+  createdAt: string;
+  updatedAt: string;
+  expiresAt: string;
+  error?: string;
+}
+
+export interface SandboxSnapshotRef extends SandboxSnapshotResource {
+  kind: "inngest/sandbox.snapshot";
+  version: 1;
+}
+
+export interface SandboxSnapshotWaitOptions {
+  timeout: SandboxDuration;
+}
+
+export interface SandboxLifecycleOptions {
+  timeout?: SandboxDuration;
+  signal?: AbortSignal;
+}
+
+export interface SandboxSnapshotCreateOptions {
+  /**
+   * Optional name for the snapshot. A name is held by at most one CREATING or
+   * unexpired READY snapshot at a time; creating another snapshot with a held
+   * name fails with `sandbox_snapshot_name_taken`. Names follow the same rules
+   * as sandbox names: case-sensitive, up to 255 characters, no control
+   * characters, and no leading or trailing whitespace.
+   */
+  name?: string;
+}
+
+export interface SandboxSnapshotCloneOptions {
+  name: string;
+  runningTimeout?: SandboxDuration;
+}
+
+export interface SandboxSnapshotListOptions extends SandboxListOptions {
+  /**
+   * Only return snapshots with exactly this name, newest first.
+   */
+  name?: string;
+}
+export type SandboxSnapshotListResult<TSnapshot = SandboxSnapshotRef> =
+  SandboxListResult<TSnapshot>;
+
+export type SandboxAction =
+  | "create"
+  | "list"
+  | "get"
+  | "waitUntilRunning"
+  | "exec"
+  | "destroy"
+  | "pause"
+  | "resume"
+  | "process.start"
+  | "process.list"
+  | "process.get"
+  | "process.signal"
+  | "process.wait"
+  | "process.output"
+  | "process.stream"
+  | "logs.stream"
+  | "file.upload"
+  | "file.download"
+  | "snapshot.create"
+  | "snapshot.list"
+  | "snapshot.get"
+  | "snapshot.waitUntilReady"
+  | "snapshot.delete";
+
+export type SandboxErrorCode =
+  | "access_denied"
+  | "compute_unavailable"
+  | "internal_error"
+  | "invalid_field_format"
+  | "invalid_request"
+  | "missing_field"
+  | "operation_ambiguous"
+  | "rate_limited"
+  | "sandbox_exec_output_too_large"
+  | "sandbox_exec_timed_out"
+  | "sandbox_name_taken"
+  | "sandbox_image_not_found"
+  | "sandbox_not_found"
+  | "sandbox_start_failed"
+  | "sandbox_start_timed_out"
+  | "sandbox_process_not_found"
+  | "sandbox_process_output_not_retained"
+  | "sandbox_process_wait_timed_out"
+  | "sandbox_snapshot_limit_exceeded"
+  | "sandbox_snapshot_name_taken"
+  | "sandbox_snapshot_not_found"
+  | "sandbox_snapshot_not_ready"
+  | "sandbox_snapshot_wait_timed_out"
+  | (string & {});
+
+export type SandboxErrorDetail = Record<string, unknown>;
+
+export interface SandboxErrorOptions {
+  action: SandboxAction;
+  code: SandboxErrorCode;
+  message: string;
+  status?: number;
+  sandboxId?: string;
+  processId?: string;
+  snapshotId?: string;
+  ambiguous?: boolean;
+  retryable?: boolean;
+  requestId?: string;
+  details?: readonly SandboxErrorDetail[];
+  cause?: unknown;
+}
+
+export class SandboxValidationError extends Error {
+  public override readonly cause?: unknown;
+
+  constructor(message: string, options?: { cause?: unknown }) {
+    super(message);
+    this.name = "SandboxValidationError";
+    this.cause = options?.cause;
+  }
+}
+
+export class SandboxError extends Error {
+  public readonly protocolVersion = sandboxProtocolVersion;
+  public readonly action: SandboxAction;
+  public readonly code: SandboxErrorCode;
+  public readonly status?: number;
+  public readonly sandboxId?: string;
+  public readonly processId?: string;
+  public readonly snapshotId?: string;
+  public readonly ambiguous: boolean;
+  public readonly retryable: boolean;
+  public readonly requestId?: string;
+  public readonly details: readonly SandboxErrorDetail[];
+  public override readonly cause?: unknown;
+
+  constructor(options: SandboxErrorOptions) {
+    super(options.message);
+    this.name = "SandboxError";
+    this.action = options.action;
+    this.code = options.code;
+    this.status = options.status;
+    this.sandboxId = options.sandboxId;
+    this.processId = options.processId;
+    this.snapshotId = options.snapshotId;
+    this.ambiguous =
+      options.ambiguous ?? options.code === "operation_ambiguous";
+    this.retryable = options.retryable ?? false;
+    this.requestId = options.requestId;
+    this.details = options.details ?? [];
+    this.cause = options.cause;
+  }
+}
+
+export interface Sandbox {
+  readonly kind: "inngest/sandbox";
+  readonly version: 1;
+  readonly id: string;
+  readonly name: string;
+  readonly status: SandboxStatus;
+  readonly vpcId: string;
+  readonly imageRef: string;
+  readonly imageDigest?: string;
+  readonly resources: SandboxResources;
+  readonly createdAt: string;
+  readonly startedAt?: string;
+  readonly endedAt?: string;
+  readonly error?: string;
+  readonly commands: {
+    run(
+      command: SandboxCommand,
+      options?: SandboxCommandOptions,
+    ): Promise<SandboxCommandResult>;
+  };
+  readonly logs: {
+    stream(
+      options?: SandboxLogStreamOptions,
+    ): Promise<ReadableStream<SandboxOutputChunk>>;
+  };
+  readonly files: {
+    upload(options: SandboxFileUploadOptions): Promise<SandboxFileUploadResult>;
+    download(options: SandboxFileDownloadOptions): Promise<Response>;
+  };
+  readonly processes: {
+    start(options: SandboxProcessStartOptions): Promise<SandboxProcess>;
+    list(
+      options?: SandboxProcessListOptions,
+    ): Promise<SandboxProcessListResult<SandboxProcess>>;
+    get(processId: string): Promise<SandboxProcess | null>;
+  };
+  waitUntilRunning(options: SandboxWaitUntilRunningOptions): Promise<Sandbox>;
+  pause(options?: SandboxLifecycleOptions): Promise<Sandbox>;
+  resume(options?: SandboxLifecycleOptions): Promise<Sandbox>;
+  snapshot(
+    options?: SandboxSnapshotCreateOptions,
+    waitOptions?: SandboxLifecycleOptions,
+  ): Promise<SandboxSnapshot>;
+  destroy(): Promise<SandboxDestroyResult>;
+}
+
+export interface SandboxProcess {
+  readonly kind: "inngest/sandbox.process";
+  readonly version: 1;
+  readonly sandboxId: string;
+  readonly id: string;
+  readonly command: readonly string[];
+  readonly pid?: number;
+  readonly state: SandboxProcessState;
+  readonly exitCode?: number;
+  readonly terminationSignal?: number;
+  readonly startedAt?: string;
+  readonly endedAt?: string;
+  signal(options: SandboxProcessSignalOptions): Promise<void>;
+  wait(options?: SandboxProcessWaitOptions): Promise<SandboxProcess>;
+  getOutput(
+    options?: SandboxProcessOutputOptions,
+  ): Promise<SandboxProcessOutput>;
+  streamOutput(
+    options?: SandboxProcessOutputOptions,
+  ): Promise<ReadableStream<SandboxOutputChunk>>;
+}
+
+export interface SandboxSnapshot extends Readonly<SandboxSnapshotRef> {
+  clone(
+    options: SandboxSnapshotCloneOptions,
+    waitOptions?: SandboxLifecycleOptions,
+  ): Promise<Sandbox>;
+  delete(): Promise<void>;
+}
+
+export interface SandboxClient {
+  create(options: SandboxCreateFreshOptions): Promise<Sandbox>;
+  list(options?: SandboxListOptions): Promise<SandboxListResult<Sandbox>>;
+  get(sandboxId: string): Promise<Sandbox | null>;
+  readonly snapshots: {
+    list(
+      options?: SandboxSnapshotListOptions,
+    ): Promise<SandboxSnapshotListResult<SandboxSnapshot>>;
+    get(snapshotId: string): Promise<SandboxSnapshot | null>;
+  };
+}
+
+/**
+ * The commands and files of a sandbox, which the tools and a sandbox's `setup`
+ * use.
+ */
+export type SandboxIO = Pick<DurableSandbox, "commands" | "files">;
+
+/**
+ * A sandbox as the tools listed on it see it (`context.sandbox` of a
+ * `tool.group()`): its commands and files are durable steps with scoped IDs,
+ * its commands carry the sandbox's `shims`, and it opens on first use.
+ */
+export interface SandboxHandle extends SandboxIO {
+  /**
+   * Where relative paths and commands start: the sandbox's `cwd`, or the
+   * repository's path when it has one. Default `/work`.
+   */
+  readonly cwd: string;
+
+  /**
+   * Runs a command as one step, from a tagged template: `` $`git status` ``,
+   * `` $.sh`a | b` ``, or `$(options)`. Its steps are scoped like `commands`,
+   * carry the sandbox's `shims`, and start in `cwd`.
+   */
+  readonly $: DurableSandbox["$"];
+
+  /**
+   * The shell the tools of this sandbox share (`run`, `read`, `edit`,
+   * `search`): commands that keep their working directory and exported
+   * environment. Made once per sandbox, in the place the thread's last run left
+   * it.
+   */
+  shell(): Promise<ShellSession>;
+}
+
+export interface DurableSandbox {
+  /**
+   * Run a command as one step, from a tagged template. `$.sh` runs a shell
+   * script, and `$(options)` gives a `$` with options set. See `SandboxDollar`.
+   */
+  readonly $: SandboxDollar;
+  /**
+   * A shell session on this sandbox, whose commands share a working
+   * directory and exported environment. See `SandboxShell`.
+   */
+  shell(options?: SandboxShellOptions): SandboxShell;
+  readonly kind: "inngest/sandbox";
+  readonly version: 1;
+  readonly id: string;
+  readonly name: string;
+  readonly status: SandboxStatus;
+  readonly vpcId: string;
+  readonly imageRef: string;
+  readonly imageDigest?: string;
+  readonly resources: SandboxResources;
+  readonly createdAt: string;
+  readonly startedAt?: string;
+  readonly endedAt?: string;
+  readonly error?: string;
+  readonly commands: {
+    run(
+      idOrOptions: StepOptionsOrId,
+      command: SandboxCommand,
+      options?: SandboxCommandOptions &
+        SandboxToolsOptions & {
+          /**
+           * The exit codes that are not failures. Any other exit rejects,
+           * without retrying. Defaults to `"any"`, so the exit code returns
+           * as data, except that a process ending LOST or FAILED has none
+           * and throws.
+           */
+          exitCodes?: SandboxExitCodes;
+        },
+    ): Promise<SandboxCommandResult>;
+  };
+  /**
+   * Files move through memoized steps, so each is limited by what a step can
+   * return (about 2 MiB).
+   */
+  readonly files: {
+    write(
+      idOrOptions: StepOptionsOrId,
+      options: { path: string; data: string | Uint8Array },
+    ): Promise<void>;
+    read(idOrOptions: StepOptionsOrId, path: string): Promise<Uint8Array>;
+  };
+  readonly processes: {
+    start(
+      idOrOptions: StepOptionsOrId,
+      options: SandboxProcessStartOptions,
+    ): Promise<DurableSandboxProcess>;
+    list(
+      idOrOptions: StepOptionsOrId,
+      options?: SandboxProcessListOptions,
+    ): Promise<SandboxProcessListResult<DurableSandboxProcess>>;
+    get(
+      idOrOptions: StepOptionsOrId,
+      processId: string,
+    ): Promise<DurableSandboxProcess | null>;
+  };
+  readonly snapshots: {
+    create(
+      idOrOptions: StepOptionsOrId,
+      options?: SandboxSnapshotCreateOptions,
+      waitOptions?: SandboxLifecycleOptions,
+    ): Promise<DurableSandboxSnapshot>;
+  };
+  snapshot(
+    idOrOptions: StepOptionsOrId,
+    options?: SandboxSnapshotCreateOptions,
+    waitOptions?: SandboxLifecycleOptions,
+  ): Promise<DurableSandboxSnapshot>;
+  pause(
+    idOrOptions: StepOptionsOrId,
+    options?: SandboxLifecycleOptions,
+  ): Promise<DurableSandbox>;
+  resume(
+    idOrOptions: StepOptionsOrId,
+    options?: SandboxLifecycleOptions,
+  ): Promise<DurableSandbox>;
+  waitUntilRunning(
+    idOrOptions: StepOptionsOrId,
+    options: SandboxWaitUntilRunningOptions,
+  ): Promise<DurableSandbox>;
+  destroy(idOrOptions: StepOptionsOrId): Promise<SandboxDestroyResult>;
+}
+
+export interface DurableSandboxSnapshot {
+  readonly kind: "inngest/sandbox.snapshot";
+  readonly version: 1;
+  readonly id: string;
+  readonly name?: string;
+  readonly sourceImageId: string;
+  readonly status: SandboxSnapshotStatus;
+  readonly compatibilityId?: string;
+  readonly resources: SandboxResources;
+  readonly memoryPackCount: number;
+  readonly diskPackCount: number;
+  readonly storedBytes: number;
+  readonly createdAt: string;
+  readonly updatedAt: string;
+  readonly expiresAt: string;
+  readonly error?: string;
+  waitUntilReady(
+    idOrOptions: StepOptionsOrId,
+    options: SandboxSnapshotWaitOptions,
+  ): Promise<DurableSandboxSnapshot>;
+  delete(idOrOptions: StepOptionsOrId): Promise<void>;
+  clone(
+    idOrOptions: StepOptionsOrId,
+    options: SandboxSnapshotCloneOptions,
+    waitOptions?: SandboxLifecycleOptions,
+  ): Promise<DurableSandbox>;
+}
+
+export interface DurableSandboxProcess {
+  readonly kind: "inngest/sandbox.process";
+  readonly version: 1;
+  readonly sandboxId: string;
+  readonly id: string;
+  readonly command: readonly string[];
+  readonly pid?: number;
+  readonly state: SandboxProcessState;
+  readonly exitCode?: number;
+  readonly terminationSignal?: number;
+  readonly startedAt?: string;
+  readonly endedAt?: string;
+  signal(
+    idOrOptions: StepOptionsOrId,
+    options: SandboxProcessSignalOptions,
+  ): Promise<void>;
+  wait(
+    idOrOptions: StepOptionsOrId,
+    options?: SandboxProcessWaitOptions,
+  ): Promise<DurableSandboxProcess>;
+  getOutput(
+    idOrOptions: StepOptionsOrId,
+    options?: SandboxProcessOutputOptions,
+  ): Promise<SandboxProcessOutput>;
+}
+
+export interface DurableSandboxTools {
+  /**
+   * Create a sandbox. With `await using`, the sandbox is destroyed when the
+   * scope ends, in a memoized `<id>:destroy` step.
+   *
+   * Disposing can't see why the scope ended, so it also destroys before a retry.
+   */
+  create(
+    idOrOptions: StepOptionsOrId,
+    options: SandboxCreateOptions,
+  ): Promise<DurableSandbox & AsyncDisposable>;
+  list(
+    idOrOptions: StepOptionsOrId,
+    options?: SandboxListOptions,
+  ): Promise<SandboxListResult<DurableSandbox>>;
+  get(
+    idOrOptions: StepOptionsOrId,
+    sandboxId: string,
+  ): Promise<DurableSandbox | null>;
+  readonly snapshots: {
+    list(
+      idOrOptions: StepOptionsOrId,
+      options?: SandboxSnapshotListOptions,
+    ): Promise<SandboxSnapshotListResult<DurableSandboxSnapshot>>;
+    get(
+      idOrOptions: StepOptionsOrId,
+      snapshotId: string,
+    ): Promise<DurableSandboxSnapshot | null>;
+  };
+}

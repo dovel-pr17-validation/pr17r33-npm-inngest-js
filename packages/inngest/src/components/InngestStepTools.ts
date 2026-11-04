@@ -1,0 +1,1927 @@
+import { type AiAdapter, models } from "@inngest/ai";
+import type { StandardSchemaV1 } from "@standard-schema/spec";
+import { z } from "zod/v3";
+
+import { subscribeCapability } from "../helpers/consts.ts";
+import type { Jsonify } from "../helpers/jsonify.ts";
+import {
+  normalizeEventMeta,
+  stampPropagatedSessions,
+} from "../helpers/sessions.ts";
+import { timeStr } from "../helpers/strings.ts";
+import * as Temporal from "../helpers/temporal.ts";
+import type {
+  ExclusiveKeys,
+  ParametersExceptFirst,
+  SendEventPayload,
+} from "../helpers/types.ts";
+import {
+  type ApplyAllMiddlewareTransforms,
+  type Context,
+  type EventMeta,
+  type EventPayload,
+  type HashedOp,
+  type InvocationResult,
+  type InvokeTargetFunctionDefinition,
+  type MinimalEventPayload,
+  type OutgoingOp,
+  type ReceivedEventMeta,
+  type SendEventOutput,
+  type SendSignalResponse,
+  StepMode,
+  StepOpCode,
+  type StepOptions,
+  type StepOptionsOrId,
+  type StepSpan,
+  type TriggerEventFromFunction,
+} from "../types.ts";
+import {
+  countStepIssued,
+  getAsyncCtxSync,
+  runWithAsyncCtx,
+} from "./execution/als.ts";
+import type { InngestExecution } from "./execution/InngestExecution.ts";
+import { firstReport, hashedStepId } from "./execution/inboxState.ts";
+import { fetch as stepFetch } from "./Fetch.ts";
+import {
+  type ClientOptionsFromInngest,
+  type GetFunctionOutputRaw,
+  type GetStepTools,
+  type Inngest,
+  internalLoggerSymbol,
+  sessionPropagationSymbol,
+} from "./Inngest.ts";
+import { InngestFunction } from "./InngestFunction.ts";
+import { InngestFunctionReference } from "./InngestFunctionReference.ts";
+import type { GroupTools } from "./InngestGroupTools.ts";
+import {
+  type MetadataBuilder,
+  type MetadataStepTool,
+  metadataSymbol,
+  UnscopedMetadataBuilder,
+} from "./InngestMetadata.ts";
+import {
+  type ScoreStepTool,
+  scoreSymbol,
+  sendStepScore,
+  validateStepScoreOptions,
+} from "./InngestScore.ts";
+import {
+  type Cut,
+  Inbox,
+  type InboxMessageOf,
+  type InboxSources,
+  sourcesOf,
+} from "./inbox/Inbox.ts";
+import type { Middleware } from "./middleware/index.ts";
+import { NonRetriableError } from "./NonRetriableError.ts";
+import type { Realtime } from "./realtime/types.ts";
+import { sdkOrigin } from "./sandbox/trace.ts";
+import type { EventType } from "./triggers/triggers.ts";
+
+/**
+ * Middleware context for a step, created during step registration.
+ *
+ * Uses a "deferred handler" pattern: the `wrapStep` middleware chain starts
+ * during discovery (so middleware can inject its own steps), but the real
+ * handler isn't known until after the memoization lookup. `setActualHandler`
+ * bridges the gap — the chain blocks on a deferred promise that is resolved
+ * once `executeStep` determines the real result.
+ */
+export interface StepMiddlewareContext {
+  /**
+   * Sets the handler that the middleware pipeline will eventually call.
+   * Called after memoization lookup to set either:
+   * - A handler returning memoized data, OR
+   * - A handler executing the step fresh
+   */
+  setActualHandler: (handler: () => Promise<unknown>) => void;
+
+  /**
+   * Step info after middleware transformations. The `options.id` may differ
+   * from the original if middleware modified it via `transformStepInput`.
+   */
+  stepInfo: Middleware.StepInfo;
+
+  /**
+   * The middleware pipeline entry point. Call this to execute the step
+   * through all middleware transformations.
+   */
+  wrappedHandler: () => Promise<unknown>;
+}
+
+export interface FoundStep extends HashedOp {
+  hashedId: string;
+  fn?: (...args: unknown[]) => unknown;
+  rawArgs: unknown[];
+
+  /**
+   * A boolean representing whether the step has been fulfilled, either
+   * resolving or rejecting the `Promise` returned to userland code.
+   *
+   * Note that this is distinct from {@link hasStepState}, which instead tracks
+   * whether the step has been given some state from the Executor. State from
+   * the Executor could be data other than a resolution or rejection, such as
+   * inputs.
+   */
+  fulfilled: boolean;
+
+  /**
+   * A boolean representing whether the step has been given some state from the
+   * Executor. State from the Executor could be data other than a resolution or
+   * rejection, such as inputs.
+   *
+   * This is distinct from {@link fulfilled}, which instead tracks whether the
+   * step has been fulfilled, either resolving or rejecting the `Promise`
+   * returned to userland code.
+   */
+  hasStepState: boolean;
+
+  handled: boolean;
+
+  /**
+   * The promise that has been returned to userland code for this step.
+   */
+  promise: Promise<unknown>;
+
+  /**
+   * Returns a boolean representing whether or not the step was handled on this
+   * invocation.
+   */
+  handle: () => boolean;
+
+  // TODO This is used to track the input we want for this step. Might be
+  // present in ctx from Executor.
+  input?: unknown;
+
+  /**
+   * Middleware context for this step. Holds the `wrapStep` chain entry point
+   * and the deferred handler setter used by `executeStep`.
+   */
+  middleware: StepMiddlewareContext;
+
+  /**
+   * For new steps where wrappedHandler is called during discovery,
+   * this holds the resolve/reject to be called when the step's data is
+   * memoized. Resolved with server-transformed data (post-wrapStepHandler),
+   * which unblocks wrapStep's `next()`.
+   *
+   * Is undefined when any of the following is true:
+   * - The step is fulfilled
+   * - The step has no handler (`step.sleep`, `step.waitForSignal`, etc.)
+   */
+  memoizationDeferred?: {
+    resolve: (value: unknown) => void;
+    reject: (error: unknown) => void;
+  };
+
+  /**
+   * For new steps where `wrappedHandler` is called during discovery, this holds
+   * the promise for the wrapStep-transformed result. In checkpointing mode,
+   * handle() reuses this promise to avoid a duplicate wrapStep call.
+   */
+  transformedResultPromise?: Promise<unknown>;
+
+  /**
+   * Optional metadata updates attached to this step, carried through from
+   * the OutgoingOp so that checkpoint payloads include metadata.
+   */
+  metadata?: OutgoingOp["metadata"];
+}
+
+export type MatchOpFn<
+  T extends (...args: unknown[]) => Promise<unknown> = (
+    ...args: unknown[]
+  ) => Promise<unknown>,
+> = (
+  stepOptions: StepOptions,
+  /**
+   * Arguments passed by the user.
+   */
+  ...args: ParametersExceptFirst<T>
+) => Omit<HashedOp, "data" | "error">;
+
+export type StepHandler = (info: {
+  matchOp: MatchOpFn;
+  opts?: StepToolOptions;
+  args: [StepOptionsOrId, ...unknown[]];
+}) => Promise<unknown>;
+
+export interface StepToolOptions<
+  T extends (...args: unknown[]) => Promise<unknown> = (
+    ...args: unknown[]
+  ) => Promise<unknown>,
+> {
+  /**
+   * Optionally, we can also provide a function that will be called when
+   * Inngest tells us to run this operation.
+   *
+   * If this function is defined, the first time the tool is used it will
+   * report the desired operation (including options) to the Inngest. Inngest
+   * will then call back to the function to tell it to run the step and then
+   * retrieve data.
+   *
+   * We do this in order to allow functionality such as per-step retries; this
+   * gives the SDK the opportunity to tell Inngest what it wants to do before
+   * it does it.
+   *
+   * This function is passed the arguments passed by the user. It will be run
+   * when we receive an operation matching this one that does not contain a
+   * `data` property.
+   */
+  fn?: (...args: [Context.Any, ...Parameters<T>]) => unknown;
+}
+
+export const getStepOptions = (options: StepOptionsOrId): StepOptions => {
+  if (typeof options === "string") {
+    return { id: options };
+  }
+
+  return options;
+};
+
+/**
+ * The origin a step or nested span in `path` inherits. Each span in a path
+ * already carries its effective origin, so the innermost span's is the answer.
+ * See `StepOptions["~origin"]`.
+ */
+const spanOrigin = (path: StepSpan[] | undefined): string | undefined => {
+  return path?.[path.length - 1]?.origin;
+};
+
+/**
+ * Append a span to a span path, naming it by its ID if it has no name. `kind`
+ * is only sent when given. A span without its own `origin` takes the origin of
+ * its parent, so `origin` is only sent when one is in scope.
+ */
+const appendSpan = (
+  path: (StepSpan & { name: string })[] | undefined,
+  span: StepSpan,
+): (StepSpan & { name: string })[] => {
+  const { id, name = id, kind } = span;
+  const origin = span.origin ?? spanOrigin(path);
+
+  return [
+    ...(path ?? []),
+    { id, name, ...(kind ? { kind } : {}), ...(origin ? { origin } : {}) },
+  ];
+};
+
+/**
+ * Run a callback with `span` appended to the current span path, so steps
+ * created within it carry the path. See `GroupTools["~span"]`.
+ */
+export const withSpan = <T>(span: StepSpan, callback: () => T): T => {
+  const currentCtx = getAsyncCtxSync();
+
+  if (!currentCtx?.execution) {
+    return callback();
+  }
+
+  return runWithAsyncCtx(
+    {
+      ...currentCtx,
+      execution: {
+        ...currentCtx.execution,
+        span: appendSpan(currentCtx.execution.span, span),
+      },
+    },
+    callback,
+  );
+};
+
+/**
+ * Run a callback whose steps get no group prefix before their IDs.
+ */
+export const withoutStepIdPrefix = <T>(callback: () => T): T => {
+  const currentCtx = getAsyncCtxSync();
+
+  if (!currentCtx?.execution?.stepIdPrefix) {
+    return callback();
+  }
+
+  return runWithAsyncCtx(
+    {
+      ...currentCtx,
+      execution: { ...currentCtx.execution, stepIdPrefix: undefined },
+    },
+    callback,
+  );
+};
+
+/**
+ * The tag every inbox statement carries in a trace, shown beside its row.
+ */
+export const inboxTag = "\u2709\uFE0F";
+
+/**
+ * The options that make an op one part of the inbox statement `statement`.
+ * Every op of a statement shares the span, which the trace shows as one group
+ * row carrying `inboxTag`, and each has the SDK's origin, so the trace dims it
+ * inside that row.
+ */
+const inboxStatement = (
+  statement: string,
+  name: string,
+  op: string,
+): StepOptions => {
+  return {
+    id: op,
+    "~span": { id: statement, name, kind: inboxTag },
+    "~origin": sdkOrigin,
+  };
+};
+
+/**
+ * Run a callback whose steps get `prefix` before their IDs, so concurrent
+ * callers can use the same IDs.
+ */
+export const withStepIdPrefix = <T>(prefix: string, callback: () => T): T => {
+  const currentCtx = getAsyncCtxSync();
+
+  if (!currentCtx?.execution) {
+    return callback();
+  }
+
+  return runWithAsyncCtx(
+    {
+      ...currentCtx,
+      execution: {
+        ...currentCtx.execution,
+        stepIdPrefix: `${currentCtx.execution.stepIdPrefix ?? ""}${prefix}`,
+      },
+    },
+    callback,
+  );
+};
+
+/**
+ * Suffix used to namespace steps that are automatically indexed.
+ */
+export const STEP_INDEXING_SUFFIX = ":";
+
+/**
+ * Create a new set of step function tools ready to be used in a step function.
+ * This function should be run and a fresh set of tools provided every time a
+ * function is run.
+ *
+ * An op stack (function state) is passed in as well as some mutable properties
+ * that the tools can use to submit a new op.
+ */
+/**
+ * Merge client-level and function-level middleware into a single array type
+ * for use with ApplyAllMiddlewareTransforms etc.
+ */
+type MergedMiddleware<
+  TClient extends Inngest.Any,
+  TFnMiddleware extends Middleware.Class[] | undefined,
+> = [
+  ...(ClientOptionsFromInngest<TClient>["middleware"] extends Middleware.Class[]
+    ? ClientOptionsFromInngest<TClient>["middleware"]
+    : []),
+  ...(TFnMiddleware extends Middleware.Class[] ? TFnMiddleware : []),
+];
+
+export const createStepTools = <
+  TClient extends Inngest.Any,
+  TFnMiddleware extends Middleware.Class[] | undefined = undefined,
+>(
+  client: TClient,
+  execution: InngestExecution,
+  stepHandler: StepHandler,
+) => {
+  /**
+   * A local helper used to create tools that can be used to submit an op.
+   *
+   * When using this function, a generic type should be provided which is the
+   * function signature exposed to the user.
+   */
+  // biome-ignore lint/suspicious/noExplicitAny: intentional
+  const createTool = <T extends (...args: any[]) => Promise<unknown>>(
+    /**
+     * A function that returns an ID for this op. This is used to ensure that
+     * the op stack is correctly filled, submitted, and retrieved with the same
+     * ID.
+     *
+     * It is passed the arguments passed by the user.
+     *
+     * Most simple tools will likely only need to define this.
+     */
+    matchOp: MatchOpFn<T>,
+    opts?: StepToolOptions<T>,
+  ): T => {
+    const wrappedMatchOp: MatchOpFn<T> = (stepOptions, ...rest) => {
+      const alsCtx = getAsyncCtxSync()?.execution;
+      const prefix = alsCtx?.stepIdPrefix;
+
+      if (alsCtx?.instance) {
+        countStepIssued(alsCtx.instance);
+      }
+
+      const op = matchOp(
+        prefix
+          ? {
+              ...stepOptions,
+              id: `${prefix}${stepOptions.id}`,
+              name: stepOptions.name ?? stepOptions.id,
+            }
+          : stepOptions,
+        ...rest,
+      );
+
+      if (alsCtx?.insideExperimentSelect) {
+        throw new NonRetriableError(
+          "Step tools (step.run, step.sleep, etc.) cannot be called inside " +
+            "an experiment select() callback. Move step calls into variant " +
+            "callbacks instead.",
+        );
+      }
+
+      // Explicit option takes precedence, then check ALS context
+      const parallelMode = stepOptions.parallelMode ?? alsCtx?.parallelMode;
+
+      if (parallelMode) {
+        op.opts = { ...op.opts, parallelMode };
+      }
+
+      // The span option nests inside the `group["~span"]()` scope, if any
+      const span = stepOptions["~span"]
+        ? appendSpan(alsCtx?.span, stepOptions["~span"])
+        : alsCtx?.span;
+
+      if (span) {
+        op.opts = { ...op.opts, span };
+      }
+
+      // The step's own origin wins, then the innermost span's
+      const origin = stepOptions["~origin"] ?? spanOrigin(span);
+
+      if (origin) {
+        op.opts = { ...op.opts, origin };
+      }
+
+      // Propagate experiment context to variant sub-steps
+      const experimentContext = alsCtx?.experimentContext;
+      if (experimentContext) {
+        op.opts = { ...op.opts, ...experimentContext };
+      }
+
+      // Track that a step tool was invoked inside a variant callback
+      const tracker = alsCtx?.experimentStepTracker;
+      if (tracker) {
+        tracker.found = true;
+      }
+
+      return op;
+    };
+
+    return (async (...args: Parameters<T>): Promise<unknown> => {
+      const parsedArgs = args as unknown as [StepOptionsOrId, ...unknown[]];
+      return stepHandler({ args: parsedArgs, matchOp: wrappedMatchOp, opts });
+    }) as T;
+  };
+
+  /**
+   * Create a new step run tool that can be used to run a step function using
+   * `step.run()` as a shim.
+   */
+  const createStepRun = (
+    /**
+     * The sub-type of this step tool, exposed via `opts.type` when the op is
+     * reported.
+     */
+    type?: string,
+  ) => {
+    return createTool<
+      // biome-ignore lint/suspicious/noExplicitAny: intentional
+      <TFn extends (...args: any[]) => unknown>(
+        idOrOptions: StepOptionsOrId,
+
+        /**
+         * The function to run when this step is executed. Can be synchronous or
+         * asynchronous.
+         *
+         * The return value of this function will be the return value of this
+         * call to `run`, meaning you can return and reason about return data
+         * for next steps.
+         */
+        fn: TFn,
+
+        /**
+         * Optional input to pass to the function. If this is specified, Inngest
+         * will keep track of the input for this step and be able to display it
+         * in the UI.
+         */
+        ...input: Parameters<TFn>
+      ) => Promise<
+        ApplyAllMiddlewareTransforms<
+          MergedMiddleware<TClient, TFnMiddleware>,
+          TFn extends (...args: Parameters<TFn>) => Promise<infer U>
+            ? Awaited<U extends void ? null : U>
+            : ReturnType<TFn> extends void
+              ? null
+              : ReturnType<TFn>
+        >
+      >
+    >(
+      ({ id, name }, _fn, ...input) => {
+        const opts: HashedOp["opts"] = {
+          ...(input.length ? { input } : {}),
+          ...(type ? { type } : {}),
+        };
+
+        return {
+          id,
+          mode: StepMode.Sync,
+          op: StepOpCode.StepPlanned,
+          name: id,
+          displayName: name ?? id,
+          ...(Object.keys(opts).length ? { opts } : {}),
+          userland: { id },
+        };
+      },
+      {
+        fn: (_, __, fn, ...input) => fn(...input),
+      },
+    );
+  };
+
+  /**
+   * Creates a metadata builder wrapper for step.metadata("id").
+   * Uses MetadataBuilder for config accumulation, but wraps .update() in tools.run() for memoization.
+   */
+  const createStepMetadataWrapper = (
+    memoizationId: string,
+    builder?: UnscopedMetadataBuilder,
+  ) => {
+    if (!client["experimentalMetadataEnabled"]) {
+      throw new Error(
+        'step.metadata() is experimental. Enable it by adding metadataMiddleware() from "inngest/experimental" to your client middleware.',
+      );
+    }
+    const withBuilder = (next: UnscopedMetadataBuilder) =>
+      createStepMetadataWrapper(memoizationId, next);
+
+    if (!builder) {
+      builder = new UnscopedMetadataBuilder(client).run();
+    }
+
+    return {
+      run: (runId?: string) => withBuilder(builder.run(runId)),
+      step: (stepId: string, index?: number) =>
+        withBuilder(builder.step(stepId, index)),
+      attempt: (attemptIndex: number) =>
+        withBuilder(builder.attempt(attemptIndex)),
+      span: (spanId: string) => withBuilder(builder.span(spanId)),
+      set: async (
+        values: Record<string, unknown>,
+        kind = "default",
+      ): Promise<void> => {
+        await tools.run(memoizationId, async () => {
+          await builder.set(values, kind);
+        });
+      },
+      /**
+       * @deprecated Use `set()` instead. See `MetadataBuilder.update()`.
+       */
+      update: async (
+        values: Record<string, unknown>,
+        kind = "default",
+      ): Promise<void> => {
+        await tools.run(memoizationId, async () => {
+          await builder.update(values, kind);
+        });
+      },
+
+      do: async (
+        fn: (builder: MetadataBuilder) => Promise<void>,
+      ): Promise<void> => {
+        await tools.run(memoizationId, async () => {
+          await fn(builder);
+        });
+      },
+    };
+  };
+
+  const createStepScoreWrapper: ScoreStepTool = async (
+    memoizationId,
+    options,
+  ) => {
+    if (!client["experimentalScoreEnabled"]) {
+      // This is a config error, so retrying the function cannot fix it
+      throw new NonRetriableError(
+        'step.score() is experimental. Enable it by adding scoreMiddleware() from "inngest/experimental" to your client middleware.',
+      );
+    }
+
+    validateStepScoreOptions(options);
+
+    await tools.run(memoizationId, async () => {
+      await sendStepScore(client, options);
+    });
+  };
+
+  /**
+   * Define the set of tools the user has access to for their step functions.
+   *
+   * Each key is the function name and is expected to run `createTool` and pass
+   * a generic type for that function as it will appear in the user's code.
+   */
+  const tools = {
+    /**
+     * EXPERIMENTAL: opens an inbox inside the run. Every event that matches
+     * one of the sources and arrives afterwards becomes a message, saved once
+     * as its own step whether or not it is read. Read the inbox with `next()`.
+     *
+     * A source is written like a trigger: an event type (or its name), or an
+     * object with the event and an `if` expression, which sees the arriving
+     * event as `async`. Pass one source or an array.
+     *
+     * The inbox's messages are typed from the sources: the union of the shapes
+     * of the event types given. A source written as a name has no schema, so
+     * its messages stay the default message, whose `data` is `unknown`.
+     *
+     * @example
+     * ```ts
+     * await using inbox = step.subscribe("reviews", pr.reviewed);
+     * const review = await inbox.next();
+     * ```
+     */
+    subscribe: <const S extends InboxSources>(
+      idOrOptions: StepOptionsOrId,
+      sources: S, // what the inbox receives
+    ): Inbox<InboxMessageOf<S>> => {
+      const id = typeof idOrOptions === "string" ? idOrOptions : idOrOptions.id;
+      const capabilities = getAsyncCtxSync()?.execution?.executorCapabilities;
+
+      if (capabilities && !capabilities.includes(subscribeCapability)) {
+        throw new NonRetriableError(
+          "step.subscribe needs an executor that supports inboxes, and this one did not say it does. Upgrade the Dev Server (`npx inngest-cli@latest dev`) or use an Inngest Cloud environment with inboxes enabled.",
+        );
+      }
+
+      const prefix = getAsyncCtxSync()?.execution?.stepIdPrefix ?? "";
+
+      // What the user wrote for each read, learnt when the read is reported.
+      const statements = new Map<string, string>();
+      const statementOf = (op: string) => {
+        return op.endsWith(":read") ? op.slice(0, -":read".length) : op;
+      };
+
+      return new Inbox({
+        sources: sourcesOf(sources),
+        id,
+        open: async (_op, opened) => {
+          let opening: { id: string } | undefined;
+
+          await tools["~inboxOpen"](inboxStatement(id, "subscribe", id), {
+            sources: opened,
+            track: (op) => {
+              opening = op;
+            },
+          });
+
+          // The engine gives the op a suffix (`inbox:1`) when the run already
+          // has a step with its ID, after the op is made. Everything else
+          // about the inbox is named from the ID it settled with.
+          const final = opening?.id ?? `${prefix}${id}`;
+
+          return {
+            id: final.startsWith(prefix) ? final.slice(prefix.length) : final,
+            inbox: hashedStepId(final),
+          };
+        },
+        waitId: (op) => {
+          return hashedStepId(`${prefix}${op}`);
+        },
+        wait: (op, inbox, seen, timeout) => {
+          return tools["~inboxWait"](inboxStatement(op, "next", op), {
+            inbox,
+            seen,
+            ...(timeout === undefined
+              ? {}
+              : { timeout: timeStr(timeout, client[internalLoggerSymbol]) }),
+          });
+        },
+        read: (inbox, taken, wait) => {
+          return (
+            getAsyncCtxSync()?.execution?.inbox?.read(inbox, taken, wait) ?? {
+              found: "nothing",
+            }
+          );
+        },
+        unread: (inbox, taken, upTo) => {
+          return (
+            getAsyncCtxSync()?.execution?.inbox?.unread(inbox, taken, upTo) ??
+            []
+          );
+        },
+        batch: (op, read) => {
+          const name = read.drain ? "drain" : "nextBatch";
+          statements.set(op, name);
+
+          return tools["~inboxWait"](inboxStatement(op, name, op), {
+            inbox: read.inbox,
+            seen: read.seen,
+            ...(read.timeout === undefined
+              ? {}
+              : {
+                  timeout: timeStr(read.timeout, client[internalLoggerSymbol]),
+                }),
+            batch: {
+              ...(read.drain ? { drain: true } : {}),
+              ...(read.unread ? { unread: true } : {}),
+              ...(read.max === undefined ? {} : { max: read.max }),
+            },
+          });
+        },
+        answered: (op) => {
+          return (
+            getAsyncCtxSync()?.execution?.stepAnswer?.(`${prefix}${op}`)
+              .found === true
+          );
+        },
+        message: (messageId) => {
+          return getAsyncCtxSync()?.execution?.inbox?.message(messageId);
+        },
+        report: (op, inbox, messages, draw, row) => {
+          const runId = getAsyncCtxSync()?.execution?.ctx.runId;
+
+          if (
+            // A drawn read with no row and no messages is the read of a
+            // message that is not in the inbox, such as the trigger.
+            (messages.length === 0 && (!draw || row !== undefined)) ||
+            runId === undefined ||
+            !firstReport(runId, `${prefix}${op}`)
+          ) {
+            return;
+          }
+
+          const statement = statementOf(op);
+
+          void tools["~inboxRead"](
+            inboxStatement(statement, statements.get(statement) ?? "next", op),
+            {
+              inbox,
+              messages,
+              draw,
+              ...(row === undefined ? {} : { row }),
+            },
+          ).catch(() => undefined);
+        },
+        skip: async (op) => {
+          await getAsyncCtxSync()?.execution?.skipStep?.(`${prefix}${op}`);
+        },
+        lastSeen: () => {
+          return getAsyncCtxSync()?.execution?.inbox?.lastSeen() ?? "";
+        },
+        closed: (op) => {
+          return (
+            getAsyncCtxSync()?.execution?.stepAnswer?.(`${prefix}${op}`)
+              .found === true
+          );
+        },
+        close: (op, closing) => {
+          return tools["~inboxClose"](
+            inboxStatement(op, "close", op),
+            closing,
+          ) as Promise<Cut>;
+        },
+        place: async (id) => {
+          await getAsyncCtxSync()?.execution?.inbox?.place(id);
+        },
+      });
+    },
+
+    /**
+     * The op that opens an inbox. Used by `subscribe`.
+     */
+    "~inboxOpen": createTool<
+      (
+        idOrOptions: StepOptionsOrId,
+        opts: {
+          sources: { event: string; if?: string }[];
+
+          // Called with the op, which the engine gives its final ID later.
+          track?: (op: { id: string }) => void;
+        },
+      ) => Promise<unknown>
+    >(({ id, name }, opts) => {
+      const op = {
+        id,
+        mode: StepMode.Async,
+        op: StepOpCode.Subscribe,
+        name: id,
+        displayName: name ?? id,
+        opts: { sources: opts.sources },
+        userland: { id },
+      };
+
+      opts.track?.(op);
+
+      return op;
+    }),
+
+    /**
+     * The op that closes an inbox. Used by `subscribe`. It settles with the cut
+     * the executor saved: the last message the inbox had.
+     */
+    "~inboxClose": createTool<
+      (
+        idOrOptions: StepOptionsOrId,
+        opts: { inbox: string },
+      ) => Promise<unknown>
+    >(({ id, name }, opts) => {
+      return {
+        id,
+        mode: StepMode.Async,
+        op: StepOpCode.SubscribeClose,
+        name: id,
+        displayName: name ?? id,
+        opts: { inbox: opts.inbox },
+        userland: { id },
+      };
+    }),
+
+    /**
+     * The op of a read of an inbox that has nothing unread. Used by
+     * `subscribe`. It is never answered from state: the executor wakes the run
+     * and the read finds its message there.
+     */
+    "~inboxWait": createTool<
+      (
+        idOrOptions: StepOptionsOrId,
+        opts: {
+          inbox: string;
+          seen: string;
+          timeout?: string;
+          batch?: { drain?: boolean; unread?: boolean; max?: number };
+        },
+      ) => Promise<unknown>
+    >(({ id, name }, opts) => {
+      return {
+        id,
+        mode: StepMode.Async,
+        op: StepOpCode.SubscribeWait,
+        name: id,
+        displayName: name ?? id,
+        opts: {
+          inbox: opts.inbox,
+          seen: opts.seen,
+          ...(opts.timeout === undefined ? {} : { timeout: opts.timeout }),
+          ...(opts.batch === undefined ? {} : { batch: opts.batch }),
+        },
+        userland: { id },
+      };
+    }),
+
+    /**
+     * The lazy op that reports the messages a read took. Used by `subscribe`.
+     * It rides on the next message to the executor and has no answer.
+     */
+    "~inboxRead": createTool<
+      (
+        idOrOptions: StepOptionsOrId,
+        opts: {
+          inbox: string;
+          messages: string[];
+          draw: boolean;
+          row?: string;
+        },
+      ) => Promise<void>
+    >(({ id, name }, opts) => {
+      return {
+        id,
+        mode: StepMode.Sync,
+        op: StepOpCode.SubscribeRead,
+        name: id,
+        displayName: name ?? id,
+        opts: {
+          inbox: opts.inbox,
+          messages: opts.messages,
+          ...(opts.draw ? { draw: true } : {}),
+          ...(opts.row === undefined ? {} : { row: opts.row }),
+        },
+        userland: { id },
+      };
+    }),
+
+    /**
+     * Send one or many events to Inngest. Should always be used in place of
+     * `inngest.send()` to ensure that the event send is successfully retried
+     * and not sent multiple times due to memoisation.
+     *
+     * @example
+     * ```ts
+     * await step.sendEvent("emit-user-creation", {
+     *   name: "app/user.created",
+     *   data: { id: 123 },
+     * });
+     *
+     * await step.sendEvent("emit-user-updates", [
+     *   {
+     *     name: "app/user.created",
+     *     data: { id: 123 },
+     *   },
+     *   {
+     *     name: "app/user.feed.created",
+     *     data: { id: 123 },
+     *   },
+     * ]);
+     * ```
+     *
+     * Returns a promise that will resolve once the event has been sent.
+     */
+    sendEvent: createTool<
+      (
+        idOrOptions: StepOptionsOrId,
+        payload: SendEventPayload,
+      ) => Promise<SendEventOutput<ClientOptionsFromInngest<TClient>>>
+    >(
+      ({ id, name }) => {
+        return {
+          id,
+          mode: StepMode.Sync,
+          op: StepOpCode.StepPlanned,
+          name: "sendEvent",
+          displayName: name ?? id,
+          opts: {
+            type: "step.sendEvent",
+          },
+          userland: { id },
+        };
+      },
+      {
+        fn: (ctx, _idOrOptions, payload) => {
+          const fn = execution["options"]["fn"];
+          // Only stamp inherited sessions when the client-level toggle is on.
+          //
+          // `_send` also stamps from the ambient run context, so for a Node
+          // runtime this is redundant — but deliberately so: it stamps
+          // synchronously from the direct `ctx`, and so still works on runtimes
+          // where `_send`'s AsyncLocalStorage read comes back empty. `_send`
+          // leaves this stamp authoritative.
+          const payloadToSend = client[sessionPropagationSymbol]
+            ? stampPropagatedSessions(payload, ctx.sessions)
+            : payload;
+          return client["_send"]({
+            payload: payloadToSend,
+            headers: execution["options"]["headers"],
+            fnMiddleware: fn.opts.middleware ?? [],
+            fn,
+          });
+        },
+      },
+    ),
+
+    /**
+     * EXPERIMENTAL: This API is not yet stable and may change in the future
+     * without a major version bump.
+     *
+     * Wait for a particular signal to be received before continuing. When the
+     * signal is received, its data will be returned.
+     */
+    waitForSignal: createTool<
+      <TData>(
+        idOrOptions: StepOptionsOrId,
+        opts: WaitForSignalOpts,
+      ) => Promise<{ signal: string; data: Jsonify<TData> } | null>
+    >(({ id, name }, opts) => {
+      return {
+        id,
+        mode: StepMode.Async,
+        op: StepOpCode.WaitForSignal,
+        name: opts.signal,
+        displayName: name ?? id,
+        opts: {
+          signal: opts.signal,
+          timeout: timeStr(opts.timeout, client[internalLoggerSymbol]),
+          conflict: opts.onConflict,
+        },
+        userland: { id },
+      };
+    }),
+
+    /**
+     * Step-level functionality related to realtime features.
+     *
+     * Unlike client-level realtime methods (`inngest.realtime.*`), these tools
+     * will be their own durable steps when run. If you wish to use realtime
+     * features outside of a step, make sure to use the client-level methods
+     * instead.
+     */
+    realtime: {
+      /**
+       * Publish a realtime message as a durable step. Memoized and will not
+       * re-fire on retry, unlike client-level `inngest.realtime.publish()`.
+       *
+       * Uses topic accessors: `step.realtime.publish("id", chat.status, data)`
+       */
+      publish: createTool<
+        <TData>(
+          idOrOptions: StepOptionsOrId,
+          topicRef: Realtime.TopicRef<TData>,
+          data: TData,
+        ) => Promise<TData>
+      >(
+        ({ id, name }) => {
+          return {
+            id,
+            mode: StepMode.Sync,
+            op: StepOpCode.StepPlanned,
+            displayName: name ?? id,
+            opts: {
+              type: "step.realtime.publish",
+            },
+            userland: { id },
+          };
+        },
+        {
+          fn: async (ctx, _idOrOptions, topicRef, data) => {
+            const topicConfig = topicRef.config;
+            if (topicConfig && "schema" in topicConfig && topicConfig.schema) {
+              const result =
+                await topicConfig.schema["~standard"].validate(data);
+              if (result.issues) {
+                throw new Error(
+                  `Schema validation failed for topic "${topicRef.topic}"`,
+                );
+              }
+            }
+
+            const res = await client["inngestApi"].publish(
+              {
+                topics: [topicRef.topic],
+                channel: topicRef.channel,
+                runId: ctx.runId,
+              },
+              data,
+            );
+
+            if (!res.ok) {
+              throw new Error(
+                `Failed to publish to realtime: ${res.error?.error || "Unknown error"}`,
+              );
+            }
+
+            return data;
+          },
+        },
+      ),
+    },
+
+    /**
+     * Send a Signal to Inngest.
+     */
+    sendSignal: createTool<
+      (
+        idOrOptions: StepOptionsOrId,
+        opts: SendSignalOpts,
+      ) => Promise<SendSignalResponse>
+    >(
+      ({ id, name }, opts) => {
+        return {
+          id,
+          mode: StepMode.Sync,
+          op: StepOpCode.StepPlanned,
+          name: "sendSignal",
+          displayName: name ?? id,
+          opts: {
+            type: "step.sendSignal",
+            signal: opts.signal,
+          },
+          userland: { id },
+        };
+      },
+      {
+        fn: (_ctx, _idOrOptions, opts) => {
+          return client["_sendSignal"]({
+            signal: opts.signal,
+            data: opts.data,
+            headers: execution["options"]["headers"],
+          });
+        },
+      },
+    ),
+
+    /**
+     * Wait for a particular event to be received before continuing. When the
+     * event is received, it will be returned.
+     *
+     * You can also provide options to control the particular event that is
+     * received, for example to ensure that a user ID matches between two
+     * events, or to only wait a maximum amount of time before giving up and
+     * returning `null` instead of any event data.
+     */
+    waitForEvent: createTool<
+      <
+        TOpts extends {
+          /**
+           * The event to wait for.
+           */
+          event:
+            | string
+            // biome-ignore lint/suspicious/noExplicitAny: Allow any schema
+            | EventType<string, any>;
+
+          /**
+           * The step function will wait for the event for a maximum of this
+           * time, at which point the signal will be returned as `null` instead
+           * of any signal data.
+           *
+           * The time to wait can be specified using a `number` of milliseconds,
+           * an `ms`-compatible time string like `"1 hour"`, `"30 mins"`, or
+           * `"2.5d"`, a `Date`, a `Temporal.Duration` (relative wait), or a
+           * `Temporal.Instant` / `Temporal.ZonedDateTime` (absolute deadline).
+           *
+           * Durations of less than 1 second round up to `1s`, the minimum
+           * resolution of a durable wait.
+           *
+           * {@link https://npm.im/ms}
+           */
+          timeout:
+            | number
+            | string
+            | Date
+            | Temporal.DurationLike
+            | Temporal.InstantLike
+            | Temporal.ZonedDateTimeLike;
+        } & ExclusiveKeys<{ match?: string; if?: string }, "match", "if">,
+      >(
+        idOrOptions: StepOptionsOrId,
+        opts: TOpts,
+      ) => Promise<WaitForEventResult<TOpts>>
+    >(
+      (
+        { id, name },
+
+        /**
+         * Options to control the event we're waiting for.
+         */
+        opts,
+      ) => {
+        const matchOpts: { timeout: string; if?: string } = {
+          timeout: timeStr(
+            typeof opts === "string" ? opts : opts.timeout,
+            client[internalLoggerSymbol],
+          ),
+        };
+
+        if (typeof opts !== "string") {
+          if (opts?.match) {
+            matchOpts.if = `event.${opts.match} == async.${opts.match}`;
+          } else if (opts?.if) {
+            matchOpts.if = opts.if;
+          }
+        }
+
+        // Extract event name from string or EventType object
+        const eventName =
+          typeof opts.event === "string" ? opts.event : opts.event.name;
+
+        return {
+          id,
+          mode: StepMode.Async,
+          op: StepOpCode.WaitForEvent,
+          name: eventName,
+          opts: matchOpts,
+          displayName: name ?? id,
+          userland: { id },
+        };
+      },
+    ),
+
+    /**
+     * Use this tool to run business logic. Each call to `run` will be retried
+     * individually, meaning you can compose complex workflows that safely
+     * retry dependent asynchronous actions.
+     *
+     * The function you pass to `run` will be called only when this "step" is to
+     * be executed and can be synchronous or asynchronous.
+     *
+     * In either case, the return value of the function will be the return value
+     * of the `run` tool, meaning you can return and reason about return data
+     * for next steps.
+     */
+    run: createStepRun(),
+
+    /**
+     * AI tooling for running AI models and other AI-related tasks.
+     */
+    ai: {
+      /**
+       * Use this tool to have Inngest make your AI calls. Useful for agentic workflows.
+       *
+       * Input is also tracked for this tool, meaning you can pass input to the
+       * function and it will be displayed and editable in the UI.
+       */
+      infer: createTool<
+        <TAdapter extends AiAdapter>(
+          idOrOptions: StepOptionsOrId,
+          options: AiInferOpts<TAdapter>,
+        ) => Promise<AiAdapter.Output<TAdapter>>
+      >(({ id, name }, options) => {
+        // eslint-disable-next-line
+        const { model, body, ...rest } = options;
+
+        const modelCopy = { ...model };
+
+        // Allow the model to mutate options and body for this call
+        options.model.onCall?.(modelCopy, options.body);
+
+        return {
+          id,
+          mode: StepMode.Async,
+          op: StepOpCode.AiGateway,
+          displayName: name ?? id,
+          opts: {
+            type: "step.ai.infer",
+            url: modelCopy.url,
+            headers: modelCopy.headers,
+            auth_key: modelCopy.authKey,
+            format: modelCopy.format,
+            // eslint-disable-next-line
+            body,
+            // eslint-disable-next-line
+            ...rest,
+          },
+          userland: { id },
+        };
+      }),
+
+      /**
+       * Use this tool to wrap AI models and other AI-related tasks. Each call
+       * to `wrap` will be retried individually, meaning you can compose complex
+       * workflows that safely retry dependent asynchronous actions.
+       *
+       * Input is also tracked for this tool, meaning you can pass input to the
+       * function and it will be displayed and editable in the UI.
+       */
+      wrap: createStepRun("step.ai.wrap"),
+
+      /**
+       * Models for AI inference and other AI-related tasks.
+       */
+      models: {
+        ...models,
+      },
+    },
+
+    /**
+     * Wait a specified amount of time before continuing.
+     *
+     * The time to wait can be specified using a `number` of milliseconds or an
+     * `ms`-compatible time string like `"1 hour"`, `"30 mins"`, or `"2.5d"`.
+     *
+     * Durations of less than 1 second round up to `1s`, the minimum
+     * resolution of a durable wait.
+     *
+     * {@link https://npm.im/ms}
+     *
+     * To wait until a particular date, use `sleepUntil` instead.
+     */
+    sleep: createTool<
+      (
+        idOrOptions: StepOptionsOrId,
+
+        /**
+         * The amount of time to wait before continuing.
+         */
+        time: number | string | Temporal.DurationLike,
+      ) => Promise<void>
+    >(({ id, name }, time) => {
+      /**
+       * The presence of this operation in the returned stack indicates that the
+       * sleep is over and we should continue execution.
+       */
+      const msTimeStr: string = timeStr(time, client[internalLoggerSymbol]);
+
+      return {
+        id,
+        mode: StepMode.Async,
+        op: StepOpCode.Sleep,
+        name: msTimeStr,
+        displayName: name ?? id,
+        userland: { id },
+      };
+    }),
+
+    /**
+     * Wait until a particular date before continuing by passing a `Date`.
+     *
+     * To wait for a particular amount of time from now, always use `sleep`
+     * instead.
+     */
+    sleepUntil: createTool<
+      (
+        idOrOptions: StepOptionsOrId,
+
+        /**
+         * The date to wait until before continuing.
+         */
+        time: Date | string | Temporal.InstantLike | Temporal.ZonedDateTimeLike,
+      ) => Promise<void>
+    >(({ id, name }, time) => {
+      try {
+        const iso = Temporal.getISOString(time);
+
+        /**
+         * The presence of this operation in the returned stack indicates that the
+         * sleep is over and we should continue execution.
+         */
+        return {
+          id,
+          mode: StepMode.Async,
+          op: StepOpCode.Sleep,
+          name: iso,
+          displayName: name ?? id,
+          userland: { id },
+        };
+      } catch (err) {
+        /**
+         * If we're here, it's because the date is invalid. We'll throw a custom
+         * error here to standardise this response.
+         */
+        client[internalLoggerSymbol].warn(
+          { err },
+          "Invalid `Date`, date string, `Temporal.Instant`, or `Temporal.ZonedDateTime` passed to sleepUntil",
+        );
+
+        throw new Error(
+          `Invalid \`Date\`, date string, \`Temporal.Instant\`, or \`Temporal.ZonedDateTime\` passed to sleepUntil: ${
+            time
+          }`,
+        );
+      }
+    }),
+
+    /**
+     * Invoke a passed Inngest `function` with the given `data`. Returns the
+     * result of the returned value of the function or `null` if the function
+     * does not return a value.
+     */
+    invoke: createTool<
+      <TFunction extends InvokeTargetFunctionDefinition>(
+        idOrOptions: StepOptionsOrId,
+        opts: InvocationOpts<TFunction>,
+      ) => InvocationResult<
+        ApplyAllMiddlewareTransforms<
+          MergedMiddleware<TClient, TFnMiddleware>,
+          GetFunctionOutputRaw<TFunction>,
+          "functionOutputTransform"
+        >
+      >
+    >(({ id, name }, invokeOpts) => {
+      // Create a discriminated union to operate on based on the input types
+      // available for this tool.
+      const optsSchema = invokePayloadSchema.extend({
+        timeout: z
+          .custom<
+            | number
+            | string
+            | Date
+            | Temporal.DurationLike
+            | Temporal.InstantLike
+            | Temporal.ZonedDateTimeLike
+          >(
+            (v) =>
+              typeof v === "number" ||
+              typeof v === "string" ||
+              v instanceof Date ||
+              Temporal.isTemporalDuration(v) ||
+              Temporal.isTemporalInstant(v) ||
+              Temporal.isTemporalZonedDateTime(v),
+            { message: "Invalid timeout" },
+          )
+          .optional(),
+      });
+
+      const parsedFnOpts = optsSchema
+        .extend({
+          _type: z.literal("fnInstance").optional().default("fnInstance"),
+          function: z.instanceof(InngestFunction),
+        })
+        .or(
+          optsSchema.extend({
+            _type: z.literal("refInstance").optional().default("refInstance"),
+            function: z.instanceof(InngestFunctionReference),
+          }),
+        )
+        .safeParse(invokeOpts);
+
+      if (!parsedFnOpts.success) {
+        throw new Error(
+          `Invalid invocation options passed to invoke; must include a function instance or referenceFunction().`,
+        );
+      }
+
+      const { _type, function: fn, data, v, meta, timeout } = parsedFnOpts.data;
+      const payload = {
+        data,
+        v,
+        meta: normalizeEventMeta(meta),
+      } satisfies MinimalEventPayload;
+      const opts: {
+        payload: typeof payload;
+        function_id: string;
+        timeout?: string;
+      } = {
+        payload,
+        function_id: "",
+        timeout:
+          typeof timeout === "undefined"
+            ? undefined
+            : timeStr(timeout, client[internalLoggerSymbol]),
+      };
+
+      switch (_type) {
+        case "fnInstance":
+          opts.function_id = fn.id(fn["client"].id);
+          break;
+
+        case "refInstance":
+          opts.function_id = [fn.opts.appId || client.id, fn.opts.functionId]
+            .filter(Boolean)
+            .join("-");
+          break;
+      }
+
+      return {
+        id,
+        mode: StepMode.Async,
+        op: StepOpCode.InvokeFunction,
+        displayName: name ?? id,
+        opts,
+        userland: { id },
+      };
+    }),
+
+    /**
+     * `step.fetch` is a Fetch-API-compatible function that can be used to make
+     * any HTTP code durable if it's called within an Inngest function.
+     *
+     * It will gracefully fall back to the global `fetch` if called outside of
+     * this context, and a custom fallback can be set using the `config` method.
+     */
+    fetch: stepFetch,
+  };
+
+  // NOTE: This should be moved into the above object definition under the key
+  // "metadata" when metadata is made non-experimental.
+  (tools as unknown as ExperimentalStepTools)[metadataSymbol] = (
+    memoizationId: string,
+  ): MetadataStepTool => createStepMetadataWrapper(memoizationId);
+  (tools as unknown as ExperimentalStepTools)[scoreSymbol] =
+    createStepScoreWrapper;
+
+  // Attach a step.run variant with opts.type = "group.experiment" for use by
+  // group.experiment(). The symbol keeps it off the public `step` surface.
+  (tools as unknown as ExperimentStepTools)[experimentStepRunSymbol] =
+    createStepRun("group.experiment");
+
+  // Add an uptyped gateway
+  (tools as unknown as InternalStepTools)[gatewaySymbol] = createTool(
+    ({ id, name }, input, init) => {
+      const url = input instanceof Request ? input.url : input.toString();
+
+      const headers: Record<string, string> = {};
+      if (input instanceof Request) {
+        input.headers.forEach((value, key) => {
+          headers[key] = value;
+        });
+      } else if (init?.headers) {
+        const h = new Headers(init.headers);
+        h.forEach((value, key) => {
+          headers[key] = value;
+        });
+      }
+
+      return {
+        id,
+        mode: StepMode.Async,
+        op: StepOpCode.Gateway,
+        displayName: name ?? id,
+        opts: {
+          url,
+          method: init?.method ?? "GET",
+          headers,
+          body: init?.body,
+        },
+        userland: { id },
+      };
+    },
+  );
+
+  return tools;
+};
+
+/**
+ * A generic set of step tools, without typing information about the client used
+ * to create them.
+ */
+export type GenericStepTools = GetStepTools<Inngest.Any>;
+
+export const gatewaySymbol = Symbol.for("inngest.step.gateway");
+
+export type InternalStepTools = GetStepTools<Inngest.Any> & {
+  [gatewaySymbol]: (
+    idOrOptions: StepOptionsOrId,
+    ...args: Parameters<typeof fetch>
+  ) => Promise<{
+    status_code: number;
+    headers: Record<string, string>;
+    body: string;
+  }>;
+};
+
+export type ExperimentalStepTools = GetStepTools<Inngest.Any> & {
+  [metadataSymbol]: (memoizationId: string) => MetadataStepTool;
+  [scoreSymbol]: ScoreStepTool;
+};
+
+export const experimentStepRunSymbol = Symbol.for("inngest.group.experiment");
+
+export type ExperimentStepTools = GetStepTools<Inngest.Any> & {
+  [experimentStepRunSymbol]: (
+    idOrOptions: StepOptionsOrId,
+    fn: () => unknown,
+  ) => Promise<unknown>;
+};
+
+/**
+ * Build a proxy for a set of tools that resolves to the current execution's
+ * real tools, so anything middleware adds to them (like `step.sandbox`) is
+ * there too.
+ *
+ * `base` holds what works outside a function run. Every other key is read from
+ * the tools of the run it's used in, synchronously, so steps are still found in
+ * the tick they're called. Outside a run, a key's value is a stand-in that
+ * looks the tool up when it's called, so references saved at module scope
+ * (`const { run } = step`) still work inside a run, and reject with a clear
+ * error when called outside one.
+ */
+const createDeferredTools = <T extends object>(
+  name: "step" | "group",
+  base: object,
+  getTools: (ctx: Context.Any) => unknown,
+): T => {
+  const getCurrentTools = (): Record<PropertyKey, unknown> => {
+    const als = getAsyncCtxSync();
+    if (!als?.execution) {
+      throw new Error(
+        `\`${name}\` tools can only be used within Inngest function executions; no ${
+          als ? "execution " : ""
+        }context was found`,
+      );
+    }
+
+    return getTools(als.execution.ctx) as Record<PropertyKey, unknown>;
+  };
+
+  const tryGetCurrentTools = (): Record<PropertyKey, unknown> | undefined => {
+    try {
+      return getCurrentTools();
+    } catch {
+      return undefined;
+    }
+  };
+
+  const createStandIn = (path: string[]): unknown => {
+    return new Proxy(() => undefined, {
+      get: (_target, prop) => {
+        if (prop === "then" || typeof prop === "symbol") {
+          return undefined;
+        }
+
+        return createStandIn([...path, prop]);
+      },
+      apply: (_target, _this, args) => {
+        try {
+          let parent: unknown = getCurrentTools();
+          for (const key of path.slice(0, -1)) {
+            parent = (parent as Record<string, unknown>)[key];
+          }
+
+          const tool = (parent as Record<string, unknown>)[path.at(-1) ?? ""];
+          if (typeof tool !== "function") {
+            throw new TypeError(
+              `\`${name}.${path.join(".")}\` is not a function`,
+            );
+          }
+
+          return tool.apply(parent, args);
+        } catch (error) {
+          return Promise.reject(error);
+        }
+      },
+    });
+  };
+
+  return new Proxy(base, {
+    get: (target, prop, receiver) => {
+      if (
+        Reflect.has(target, prop) ||
+        prop === "then" ||
+        typeof prop === "symbol"
+      ) {
+        return Reflect.get(target, prop, receiver);
+      }
+
+      const tools = tryGetCurrentTools();
+
+      if (tools && !(prop in tools)) {
+        throw new Error(
+          `\`${name}.${prop}\` is not available in this run: add the middleware that provides it to the client's \`middleware\` option`,
+        );
+      }
+
+      return tools ? tools[prop] : createStandIn([prop]);
+    },
+    has: (target, prop) => {
+      if (Reflect.has(target, prop)) {
+        return true;
+      }
+
+      const tools = tryGetCurrentTools();
+
+      return tools ? prop in tools : false;
+    },
+  }) as T;
+};
+
+/**
+ * A generic set of step tools that can be used without typing information about
+ * the client used to create them.
+ *
+ * These tools use AsyncLocalStorage to find the step tools of the function run
+ * they're used in, so they include anything middleware adds, like
+ * `step.sandbox`. They reject with an error if used outside of an Inngest
+ * context.
+ *
+ * To type them with a client's middleware, see `Inngest#globals()`.
+ *
+ * The intention of these high-level tools is to allow usage of Inngest step
+ * tools within API endpoints, though they can still be used within regular
+ * Inngest functions as well.
+ */
+export const step: GenericStepTools = createDeferredTools(
+  "step",
+  {
+    get fetch() {
+      return stepFetch;
+    },
+    ai: createDeferredTools(
+      "step",
+      { models: { ...models } },
+      (ctx) => ctx.step.ai,
+    ),
+    realtime: createDeferredTools(
+      "step",
+      {},
+      (ctx) => (ctx.step as GenericStepTools).realtime,
+    ),
+  },
+  (ctx) => ctx.step,
+);
+
+/**
+ * A deferred proxy for `group` tools that finds the group tools of the function
+ * run they're used in, so it includes anything middleware adds, like
+ * `group.sandbox`.
+ *
+ * @public
+ */
+export const group: GroupTools = createDeferredTools(
+  "group",
+  { "~span": withSpan },
+  (ctx) => ctx.group,
+);
+
+/**
+ * The event payload portion of the options for `step.invoke()`. This does not
+ * include non-payload options like `timeout` or the function to invoke.
+ */
+export const invokePayloadSchema = z.object({
+  data: z.record(z.any()).optional(),
+  v: z.string().optional(),
+  meta: z
+    .object({
+      // Manual layer: RFC 7386 patch — a whole-field `null` clears all
+      // inherited sessions, so it must parse. Values stay loose here because
+      // `normalizeEventSessions` validates them right after the parse with
+      // precise per-key errors; tightening them in zod would mask those behind
+      // the generic invoke-options error.
+      sessions: z.record(z.any()).nullable().optional(),
+      // Machine-stamped layer: string/number ids only, never tombstones.
+      propagated_sessions: z
+        .record(z.union([z.string(), z.number()]))
+        .optional(),
+    })
+    .optional(),
+});
+
+type InvocationTargetOpts<TFunction extends InvokeTargetFunctionDefinition> = {
+  function: TFunction;
+};
+
+type InvocationOpts<TFunction extends InvokeTargetFunctionDefinition> =
+  InvocationTargetOpts<TFunction> &
+    Omit<TriggerEventFromFunction<TFunction>, "id"> & {
+      /**
+       * Event meta shared with the invoked run.
+       *
+       * By default the invoked run inherits the calling run's sessions. The
+       * `meta.propagated_sessions` layer is stamped automatically from
+       * `ctx.sessions`.
+       *
+       * Pass `meta.sessions` to add or override sessions on the invocation.
+       *
+       * Inheritance can be disabled at the client level.
+       *
+       * Values are normalized to strings before sending, as with
+       * `inngest.send()`.
+       */
+      meta?: EventMeta;
+
+      /**
+       * The step function will wait for the invocation to finish for a maximum
+       * of this time, at which point the retured promise will be rejected
+       * instead of resolved with the output of the invoked function.
+       *
+       * Note that the invoked function will continue to run even if this step
+       * times out.
+       *
+       * The time to wait can be specified using a `number` of milliseconds, an
+       * `ms`-compatible time string like `"1 hour"`, `"30 mins"`, or `"2.5d"`,
+       * a `Date`, a `Temporal.Duration` (relative wait), or a `Temporal.Instant`
+       * / `Temporal.ZonedDateTime` (absolute deadline).
+       *
+       * Durations of less than 1 second round up to `1s`, the minimum
+       * resolution of a durable wait.
+       *
+       * {@link https://npm.im/ms}
+       */
+      timeout?:
+        | number
+        | string
+        | Date
+        | Temporal.DurationLike
+        | Temporal.InstantLike
+        | Temporal.ZonedDateTimeLike;
+    };
+
+/**
+ * A set of parameters given to a `sendSignal` call.
+ */
+type SendSignalOpts = {
+  /**
+   * The signal to send.
+   */
+  signal: string;
+
+  /**
+   * The data to send with the signal.
+   */
+  data?: unknown;
+};
+
+/**
+ * A set of parameters given to a `waitForSignal` call.
+ */
+type WaitForSignalOpts = {
+  /**
+   * The signal to wait for.
+   */
+  signal: string;
+
+  /**
+   * The step function will wait for the signal for a maximum of this time, at
+   * which point the signal will be returned as `null` instead of any signal
+   * data.
+   *
+   * The time to wait can be specified using a `number` of milliseconds, an
+   * `ms`-compatible time string like `"1 hour"`, `"30 mins"`, or `"2.5d"`, a
+   * `Date`, a `Temporal.Duration` (relative wait), or a `Temporal.Instant` /
+   * `Temporal.ZonedDateTime` (absolute deadline).
+   *
+   * Durations of less than 1 second round up to `1s`, the minimum
+   * resolution of a durable wait.
+   *
+   * {@link https://npm.im/ms}
+   */
+  timeout:
+    | number
+    | string
+    | Date
+    | Temporal.DurationLike
+    | Temporal.InstantLike
+    | Temporal.ZonedDateTimeLike;
+
+  /**
+   * When this `step.waitForSignal()` call is made, choose whether an existing
+   * wait for the same signal should be replaced, or whether this run should
+   * fail.
+   *
+   * `"replace"` will replace any existing wait with this one, and the existing
+   * wait will remain pending until it reaches its timeout.
+   *
+   * `"fail"` will cause this run to fail if there is already a wait for the
+   * same signal.
+   */
+  onConflict: "replace" | "fail";
+};
+
+/**
+ * Computes the return type for `waitForEvent` based on the options provided.
+ *
+ * Handles three cases:
+ * 1. `event: EventType<TName, TSchema>` - extracts name and data from EventType
+ * 2. `event: string` with `schema` - uses string as name and schema for data
+ * 3. `event: string` without schema - uses string as name with untyped data
+ */
+type WaitForEventResult<TOpts> =
+  // Case 1: event is an EventType with a schema
+  TOpts extends {
+    event: EventType<
+      infer TName extends string,
+      StandardSchemaV1<infer TData extends Record<string, unknown>>
+    >;
+  }
+    ? {
+        name: TName;
+        data: TData;
+        id: string;
+        ts: number;
+        v?: string;
+        meta?: ReceivedEventMeta;
+      } | null
+    : // Case 2: event is an EventType without a schema
+      TOpts extends {
+          event: EventType<infer TName extends string, undefined>;
+        }
+      ? {
+          name: TName;
+          // biome-ignore lint/suspicious/noExplicitAny: fallback for untyped events
+          data: Record<string, any>;
+          id: string;
+          ts: number;
+          v?: string;
+          meta?: ReceivedEventMeta;
+        } | null
+      : // Case 3: event is a string with schema (spread EventType)
+        TOpts extends {
+            event: infer TName extends string;
+            schema: StandardSchemaV1<
+              infer TData extends Record<string, unknown>
+            >;
+          }
+        ? {
+            name: TName;
+            data: TData;
+            id: string;
+            ts: number;
+            v?: string;
+            meta?: ReceivedEventMeta;
+          } | null
+        : // Case 4: event is just a string
+          TOpts extends { event: infer TName extends string }
+          ? {
+              name: TName;
+              // biome-ignore lint/suspicious/noExplicitAny: fallback for untyped events
+              data: Record<string, any>;
+              id: string;
+              ts: number;
+              v?: string;
+              meta?: ReceivedEventMeta;
+            } | null
+          : EventPayload | null;
+
+/**
+ * Options for `step.ai.infer()`.
+ */
+type AiInferOpts<TModel extends AiAdapter> = {
+  /**
+   * The model to use for the inference. Create a model by importing from
+   * `"inngest"` or by using `step.ai.models.*`.
+   *
+   * @example Import `openai()`
+   * ```ts
+   * import { openai } from "inngest";
+   *
+   * const model = openai({ model: "gpt-4" });
+   * ```
+   *
+   * @example Use a model from `step.ai.models`
+   * ```ts
+   * async ({ step }) => {
+   *            const model = step.ai.models.openai({ model: "gpt-4" });
+   * }
+   * ```
+   */
+  model: TModel;
+
+  /**
+   * The input to pass to the model.
+   */
+  body: AiAdapter.Input<TModel>;
+};

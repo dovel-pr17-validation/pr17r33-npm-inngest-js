@@ -1,0 +1,22 @@
+"use server";
+
+import { getInngestApp } from "@/inngest";
+import { helloChannel } from "@/inngest/channels";
+import { getClientSubscriptionToken } from "inngest/react";
+
+export const fetchRealtimeSubscriptionToken = async () => {
+  return getClientSubscriptionToken(getInngestApp(), {
+    channel: helloChannel,
+    topics: ["logs"],
+  });
+};
+
+export const pause = async () => {
+  const inngest = getInngestApp();
+  await inngest.send({ name: "test/cancel.signal" });
+};
+
+export const resume = async () => {
+  const inngest = getInngestApp();
+  await inngest.send({ name: "test/hello.world" });
+};

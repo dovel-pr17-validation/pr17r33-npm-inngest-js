@@ -1,0 +1,338 @@
+import type { StepOptionsOrId, StepSpan } from "../../types.ts";
+import { version } from "../../version.ts";
+import { getAsyncCtxSync } from "../execution/als.ts";
+import { getStepOptions } from "../InngestStepTools.ts";
+import {
+  operationProcessId,
+  operationSandboxId,
+  operationSnapshotId,
+  type SandboxOperationResultV1,
+  type SandboxOperationV1,
+} from "./protocol.ts";
+import type { SandboxAction, SandboxError } from "./types.ts";
+
+/**
+ * The metadata kind attached to every step behind `step.sandbox`.
+ */
+export const sandboxMetadataKind = "inngest.sandbox";
+
+/**
+ * Marks the steps the SDK runs on the user's behalf, such as the create and
+ * wait inside `snapshot()`. See `StepOptions["~origin"]`.
+ */
+export const sdkOrigin = `inngest@${version}`;
+
+/**
+ * The facade method a user calls for each action, where it isn't the action's
+ * own name. Methods that share an action, like `snapshot.clone()` and
+ * `create()`, are named by the action.
+ */
+const methodForAction: Partial<Record<SandboxOperationV1["action"], string>> = {
+  exec: "commands.run",
+  "process.start": "processes.start",
+  "process.list": "processes.list",
+  "process.get": "processes.get",
+  "process.output": "process.getOutput",
+  "snapshot.list": "snapshots.list",
+  "snapshot.get": "snapshots.get",
+};
+
+/**
+ * Values of an `inngest.sandbox` metadata entry. Mirrors `SandboxMetadata` in
+ * the Inngest server's `pkg/tracing/metadata/sandbox.go`.
+ *
+ * Each step attempt sends exactly one entry, and it carries the attempt's full
+ * value set. The server folds entries for the same span and kind as merge
+ * patches, which never clear a key that a later entry omits, so an entry must
+ * never rely on an earlier one.
+ *
+ * Values stay flat: scalars and short string arrays only, no nested objects,
+ * so they survive ClickHouse `JSON` and DuckDB `VARIANT` storage unchanged.
+ */
+export type SandboxTraceMetadata = {
+  version: 1;
+  /**
+   * "wait" on the steps that only wait for a command's tool calls, which the
+   * trace folds into the command's own row.
+   */
+  kind?: "wait";
+  action: SandboxOperationV1["action"];
+  /**
+   * The facade method the user called, like "commands.run" or "snapshot".
+   */
+  method: string;
+  sandbox_id?: string;
+  sandbox_name?: string;
+  source_snapshot_id?: string;
+  command?: string[];
+  command_display?: string;
+  command_truncated?: boolean;
+  cwd?: string;
+  process_id?: string;
+  process_state?: string;
+  exit_code?: number;
+  termination_signal?: number;
+  output_truncated?: boolean;
+  snapshot_id?: string;
+  snapshot_status?: string;
+  error_code?: string;
+};
+
+/**
+ * Commands can be up to 32 KiB of argv, and a run's metadata is capped at
+ * 1 MiB, so a trace only keeps enough of a command to recognise it.
+ */
+const maxCommandMetadataChars = 1_024;
+
+const commandMetadata = (
+  argv: readonly string[],
+): Partial<SandboxTraceMetadata> => {
+  let remaining = maxCommandMetadataChars;
+  const command: string[] = [];
+  for (const argument of argv) {
+    if (remaining <= 0) {
+      break;
+    }
+    command.push(argument.slice(0, remaining));
+    remaining -= argument.length;
+  }
+
+  const isShellScript =
+    command.length === 3 && command[0] === "/bin/sh" && command[1] === "-c";
+
+  return {
+    command,
+    // `commands.run("npm test")` runs as `/bin/sh -c "npm test"`; show what
+    // the user wrote.
+    command_display: isShellScript ? command[2] : undefined,
+    command_truncated:
+      remaining < 0 || command.length < argv.length || undefined,
+  };
+};
+
+/**
+ * What the operation targets. This comes from the operation, not its result,
+ * so a failed step still names its machine.
+ */
+const targetMetadata = (
+  operation: SandboxOperationV1,
+): Partial<SandboxTraceMetadata> => {
+  const [input] = operation.input;
+  const command =
+    input && "command" in input
+      ? input.command
+      : "target" in operation && "process" in operation.target
+        ? operation.target.process.command
+        : undefined;
+
+  return {
+    sandbox_id: operationSandboxId(operation),
+    sandbox_name:
+      "target" in operation && "sandbox" in operation.target
+        ? operation.target.sandbox.name
+        : input && "name" in input
+          ? input.name
+          : undefined,
+    source_snapshot_id:
+      input && "snapshotId" in input ? input.snapshotId : undefined,
+    process_id: operationProcessId(operation),
+    snapshot_id: operationSnapshotId(operation),
+    cwd: input && "cwd" in input ? input.cwd : undefined,
+    ...(command && commandMetadata(command)),
+  };
+};
+
+const resultMetadata = (
+  result: SandboxOperationResultV1,
+): Partial<SandboxTraceMetadata> => {
+  switch (result.action) {
+    case "create":
+    case "get":
+    case "waitUntilRunning":
+    case "pause":
+    case "resume":
+      return result.sandbox
+        ? { sandbox_id: result.sandbox.id, sandbox_name: result.sandbox.name }
+        : {};
+    case "exec":
+      return {
+        exit_code: result.result.exitCode,
+        output_truncated: result.result.output.truncated || undefined,
+      };
+    case "process.start":
+    case "process.wait":
+      return {
+        process_id: result.process.id,
+        process_state: result.process.state,
+        exit_code: result.process.exitCode,
+        termination_signal: result.process.terminationSignal,
+      };
+    case "process.get":
+      return {
+        process_state: result.process?.state,
+        exit_code: result.process?.exitCode,
+        termination_signal: result.process?.terminationSignal,
+      };
+    case "snapshot.create":
+    case "snapshot.waitUntilReady":
+      return {
+        snapshot_id: result.snapshot.id,
+        snapshot_status: result.snapshot.status,
+      };
+    case "snapshot.get":
+      return { snapshot_status: result.snapshot?.status };
+    default:
+      return {};
+  }
+};
+
+/**
+ * Describe a sandbox step for the trace: what it did, and to which machine.
+ * The result is the attempt's whole entry (see `SandboxTraceMetadata`), never
+ * a partial update.
+ */
+export const sandboxTraceMetadata = (
+  operation: SandboxOperationV1,
+  outcome:
+    | { result: SandboxOperationResultV1 }
+    | { error: Pick<SandboxError, "code"> | undefined },
+): SandboxTraceMetadata => {
+  const metadata: SandboxTraceMetadata = {
+    version: 1,
+    action: operation.action,
+    method: methodForAction[operation.action] ?? operation.action,
+    ...targetMetadata(operation),
+    ...("result" in outcome
+      ? resultMetadata(outcome.result)
+      : { error_code: outcome.error?.code }),
+  };
+
+  // `undefined` doesn't survive the wire, so don't send keys for it.
+  for (const key of Object.keys(metadata) as (keyof SandboxTraceMetadata)[]) {
+    if (metadata[key] === undefined) {
+      delete metadata[key];
+    }
+  }
+
+  return metadata;
+};
+
+/**
+ * The kind of the span around each command, as `@inngest/ci` calls its own.
+ */
+export const commandSpanKind = "$";
+
+/**
+ * What each statement on a process is called after the command, where the
+ * process's first statement, `processes.start`, is the command itself.
+ */
+const processStatements: Partial<Record<SandboxAction, string>> = {
+  "process.wait": "wait",
+  "process.signal": "signal",
+  "process.output": "output",
+};
+
+/**
+ * How a step reads in the trace when its caller didn't name it.
+ */
+const defaultNames: Partial<Record<SandboxAction, string>> = {
+  create: "Create sandbox",
+  waitUntilRunning: "Wait for sandbox",
+  pause: "Pause sandbox",
+  resume: "Resume sandbox",
+  destroy: "Destroy sandbox",
+  "snapshot.delete": "Delete snapshot",
+};
+
+const maxNameChars = 100;
+
+/**
+ * The span IDs each execution has opened for commands.
+ */
+const spansOpened = new WeakMap<object, Set<string>>();
+
+/**
+ * An ID for a command's span that no other command of the execution has. Step
+ * IDs can repeat (the SDK numbers them), such as a tool's in each turn of an
+ * agent, and a span re-entered by ID would merge those commands into one row.
+ * A replay calls in the same order, so each command gets the same ID again.
+ */
+const uniqueSpanId = (
+  execution: { instance: object; stepIdPrefix?: string },
+  id: string,
+): string => {
+  const key = `${execution.stepIdPrefix ?? ""}${id}`;
+  const opened = spansOpened.get(execution.instance) ?? new Set<string>();
+  let unique = key;
+
+  for (let count = 1; opened.has(unique); count++) {
+    unique = `${key}:${count}`;
+  }
+
+  opened.add(unique);
+  spansOpened.set(execution.instance, opened);
+
+  return unique;
+};
+
+/**
+ * The step options for an operation: the caller's, with a name that reads as
+ * the action if they gave none. IDs never change, for replay.
+ */
+export const namedStep = (
+  operation: SandboxOperationV1,
+  idOrOptions: StepOptionsOrId,
+): StepOptionsOrId => {
+  const options = getStepOptions(idOrOptions);
+  const name = defaultNames[operation.action];
+
+  return name && !options.name ? { ...options, name } : idOrOptions;
+};
+
+/**
+ * The span that makes a command, or a statement on a process, one `$` row in
+ * the trace, named by the command, whatever steps it takes. Undefined where
+ * something else already groups the statement: a caller's own span, such as
+ * `@inngest/ci`'s, or where a library runs it on the user's behalf, such as
+ * the SDK's runners.
+ */
+export const commandSpan = (
+  operation: SandboxOperationV1,
+  idOrOptions: StepOptionsOrId,
+): StepSpan | undefined => {
+  const {
+    id,
+    name,
+    "~span": callerSpan,
+    "~origin": origin,
+  } = getStepOptions(idOrOptions);
+  const isCommand =
+    operation.action === "exec" ||
+    operation.action === "process.start" ||
+    operation.action in processStatements;
+  const execution = getAsyncCtxSync()?.execution;
+  const enclosing = execution?.span?.at(-1);
+
+  if (
+    !isCommand ||
+    callerSpan ||
+    (origin ?? enclosing?.origin) ||
+    enclosing?.kind === commandSpanKind
+  ) {
+    return undefined;
+  }
+
+  const { command_display, command } = sandboxTraceMetadata(operation, {
+    error: undefined,
+  });
+  const [text = ""] = (command_display ?? command?.join(" ") ?? "").split("\n");
+  const label =
+    text.length > maxNameChars ? `${text.slice(0, maxNameChars)}…` : text;
+  const statement = processStatements[operation.action];
+
+  return {
+    id: execution ? uniqueSpanId(execution, id) : id,
+    name: name ?? (statement ? `${label} (${statement})` : label),
+    kind: commandSpanKind,
+  };
+};

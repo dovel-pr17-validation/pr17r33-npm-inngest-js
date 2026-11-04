@@ -1,0 +1,787 @@
+import { internalEvents, queryKeys } from "../helpers/consts.ts";
+import { warnOnce } from "../helpers/log.ts";
+import { timeStr } from "../helpers/strings.ts";
+import type { RecursiveTuple, StrictUnion } from "../helpers/types.ts";
+import {
+  type Cancellation,
+  type CheckpointingOptions,
+  type ConcurrencyOption,
+  type DefaultMaxRuntime,
+  defaultCheckpointingOptions,
+  type FunctionConfig,
+  type Handler,
+  type InternalCheckpointingOptions,
+  type TimeStr,
+  type TimeStrBatch,
+} from "../types.ts";
+import { createExecutionEngine } from "./execution/engine.ts";
+import type {
+  IInngestExecution,
+  InngestExecutionOptions,
+} from "./execution/InngestExecution.ts";
+
+import { type Inngest, internalLoggerSymbol } from "./Inngest.ts";
+import type { Middleware } from "./middleware/middleware.ts";
+import { EventType, type EventTypeWithAnySchema } from "./triggers/triggers.ts";
+
+/**
+ * Set by the SDK's own agent functions, which run with
+ * `optimizeParallelism: false` by design: the function's options carry it as a
+ * key, and the deprecation warning for the option is not logged. It is not
+ * exported from the package.
+ */
+export const internalQuietOptimizeParallelism = Symbol(
+  "inngest.internal.quietOptimizeParallelism",
+);
+
+/**
+ * A stateless Inngest function, wrapping up function configuration and any
+ * in-memory steps to run when triggered.
+ *
+ * This function can be "registered" to create a handler that Inngest can
+ * trigger remotely.
+ *
+ * @public
+ */
+export class InngestFunction<
+  TFnOpts extends InngestFunction.Options<TTriggers, TFailureHandler>,
+  THandler extends Handler.Any,
+  TFailureHandler extends Handler.Any,
+  TClient extends Inngest.Any = Inngest.Any,
+  TTriggers extends
+    InngestFunction.Trigger<string>[] = InngestFunction.Trigger<string>[],
+> implements InngestFunction.Like
+{
+  static stepId = "step";
+  static failureSuffix = "-failure";
+
+  get [Symbol.toStringTag](): typeof InngestFunction.Tag {
+    return InngestFunction.Tag;
+  }
+
+  public readonly opts: TFnOpts;
+  // biome-ignore lint/correctness/noUnusedPrivateClassMembers: used internally
+  private readonly fn: THandler;
+  private readonly onFailureFn?: TFailureHandler;
+  protected readonly client: TClient;
+
+  /**
+   * A stateless Inngest function, wrapping up function configuration and any
+   * in-memory steps to run when triggered.
+   *
+   * This function can be "registered" to create a handler that Inngest can
+   * trigger remotely.
+   */
+  constructor(
+    client: TClient,
+
+    /**
+     * Options
+     */
+    opts: TFnOpts,
+    fn: THandler,
+  ) {
+    this.client = client;
+    this.opts = opts;
+    this.fn = fn;
+    this.onFailureFn = this.opts.onFailure;
+
+    if (
+      this.opts.optimizeParallelism === false &&
+      !(internalQuietOptimizeParallelism in this.opts)
+    ) {
+      warnOnce(
+        this.client[internalLoggerSymbol],
+        `optimize-parallelism-deprecated:${this.opts.id}`,
+        '`optimizeParallelism: false` is deprecated; use `group.parallel({ mode: "race" }, ...)` for race semantics instead',
+      );
+    }
+  }
+
+  /**
+   * The generated or given ID for this function.
+   */
+  public id(prefix?: string): string {
+    return [prefix, this.opts.id].filter(Boolean).join("-");
+  }
+
+  /**
+   * The generated or given ID for this function, prefixed with the app ID. This
+   * is used for routing invokes and identifying the function across apps.
+   */
+  protected get absoluteId(): string {
+    return this.id(this.client.id);
+  }
+
+  /**
+   * The name of this function as it will appear in the Inngest Cloud UI.
+   */
+  public get name(): string {
+    return this.opts.name || this.id();
+  }
+
+  /**
+   * The description of this function.
+   */
+  public get description(): string | undefined {
+    return this.opts.description;
+  }
+
+  /**
+   * Retrieve the Inngest config for this function.
+   */
+
+  // biome-ignore lint/correctness/noUnusedPrivateClassMembers: used within the SDK
+  private getConfig({
+    baseUrl,
+    appPrefix,
+    isConnect,
+  }: {
+    /**
+     * Must be provided a URL that will be used to access the function and step.
+     * This function can't be expected to know how it will be accessed, so
+     * relies on an outside method providing context.
+     */
+    baseUrl: URL;
+
+    /**
+     * The prefix for the app that this function is part of.
+     */
+    appPrefix: string;
+
+    /**
+     * Whether this function is being used in a Connect handler.
+     */
+    isConnect?: boolean;
+  }): FunctionConfig[] {
+    const fnId = this.id(appPrefix);
+    const stepUrl = new URL(baseUrl.href);
+    stepUrl.searchParams.set(queryKeys.FnId, fnId);
+    stepUrl.searchParams.set(queryKeys.StepId, InngestFunction.stepId);
+
+    const {
+      retries: attempts,
+      cancelOn,
+      idempotency,
+      batchEvents,
+      rateLimit,
+      throttle,
+      concurrency,
+      debounce,
+      timeouts,
+      priority,
+      singleton,
+    } = this.opts;
+
+    /**
+     * Convert retries into the format required when defining function
+     * configuration.
+     */
+    const retries = typeof attempts === "undefined" ? undefined : { attempts };
+
+    const triggers = this.getConfigTriggers(fnId);
+
+    const fn: FunctionConfig = {
+      id: fnId,
+      name: this.name,
+      triggers,
+      steps: {
+        [InngestFunction.stepId]: {
+          id: InngestFunction.stepId,
+          name: InngestFunction.stepId,
+          runtime: {
+            type: isConnect ? "ws" : "http",
+            url: stepUrl.href,
+          },
+          retries,
+        },
+      },
+      idempotency,
+      batchEvents,
+      rateLimit,
+      throttle,
+      concurrency,
+      debounce,
+      priority,
+      timeouts,
+      singleton,
+    };
+
+    if (cancelOn) {
+      fn.cancel = cancelOn.map(({ event, timeout, if: ifStr, match }) => {
+        let eventName: string;
+        if (typeof event === "string") {
+          eventName = event;
+        } else {
+          eventName = event.name;
+        }
+
+        const ret: NonNullable<FunctionConfig["cancel"]>[number] = {
+          event: eventName,
+        };
+
+        if (timeout) {
+          ret.timeout = timeStr(timeout, this.client[internalLoggerSymbol]);
+        }
+
+        if (match) {
+          ret.if = `event.${match} == async.${match}`;
+        } else if (ifStr) {
+          ret.if = ifStr;
+        }
+
+        return ret;
+      }, []);
+    }
+
+    const config: FunctionConfig[] = [fn];
+
+    if (this.onFailureFn) {
+      const id = `${fn.id}${InngestFunction.failureSuffix}`;
+      const name = `${fn.name ?? fn.id} (failure)`;
+
+      const failureStepUrl = new URL(stepUrl.href);
+      failureStepUrl.searchParams.set(queryKeys.FnId, id);
+
+      config.push({
+        id,
+        name,
+        triggers: [
+          {
+            event: internalEvents.FunctionFailed,
+            expression: `event.data.function_id == '${fnId}'`,
+          },
+        ],
+        steps: {
+          [InngestFunction.stepId]: {
+            id: InngestFunction.stepId,
+            name: InngestFunction.stepId,
+            runtime: {
+              type: "http",
+              url: failureStepUrl.href,
+            },
+            retries: { attempts: 1 },
+          },
+        },
+      });
+    }
+
+    return config;
+  }
+
+  /**
+   * Build the trigger list for this function's `getConfig` payload. Subclasses
+   * (e.g. `DeferredFunction`) override this to emit implicit triggers.
+   */
+  protected getConfigTriggers(_fnId: string): FunctionConfig["triggers"] {
+    const triggers: FunctionConfig["triggers"] = [];
+
+    for (const trigger of this.opts.triggers ?? []) {
+      if (trigger.cron) {
+        const cronTrigger = trigger as { cron: string; jitter?: string };
+        triggers.push({
+          cron: cronTrigger.cron,
+          ...(cronTrigger.jitter ? { jitter: cronTrigger.jitter } : {}),
+        });
+        continue;
+      }
+
+      if (!trigger.event) {
+        continue;
+      }
+
+      // The invoke event is in the triggers if they used the `invoke` trigger
+      // helper. But we need to remove it in the config, or else the function
+      // will be triggered by any invoke.
+      let eventName = trigger.event;
+      if (eventName instanceof EventType) {
+        eventName = eventName.name;
+      }
+      if (eventName === internalEvents.FunctionInvoked) {
+        continue;
+      }
+
+      triggers.push({ event: eventName, expression: trigger.if });
+    }
+
+    return triggers;
+  }
+
+  protected createExecution(opts: CreateExecutionOptions): IInngestExecution {
+    const options: InngestExecutionOptions = {
+      fn: this,
+      ...opts.partialOptions,
+    };
+
+    return createExecutionEngine(options);
+  }
+
+  // biome-ignore lint/correctness/noUnusedPrivateClassMembers: used within the SDK
+  private shouldOptimizeParallelism(): boolean {
+    // TODO We should check the commhandler's client instead of this one?
+    return (
+      this.opts.optimizeParallelism ??
+      this.client["options"].optimizeParallelism ??
+      true
+    );
+  }
+
+  // biome-ignore lint/correctness/noUnusedPrivateClassMembers: used within the SDK
+  private shouldAsyncCheckpoint(
+    requestedRunStep: string | undefined,
+    internalFnId: string | undefined,
+    disableImmediateExecution: boolean,
+    defaultMaxRuntime: DefaultMaxRuntime,
+  ): InternalCheckpointingOptions | undefined {
+    if (requestedRunStep || !internalFnId || disableImmediateExecution) {
+      return;
+    }
+
+    // TODO We should check the commhandler's client instead of this one?
+    const userCfg =
+      this.opts.checkpointing ??
+      this.client["options"].checkpointing ??
+      this.opts.experimentalCheckpointing ??
+      this.client["options"].experimentalCheckpointing ??
+      true;
+
+    if (!userCfg) {
+      // Opted out
+      return;
+    }
+
+    if (userCfg === true) {
+      return {
+        ...defaultCheckpointingOptions,
+        maxRuntime: defaultMaxRuntime,
+      };
+    }
+
+    return {
+      bufferedSteps:
+        userCfg.bufferedSteps ?? defaultCheckpointingOptions.bufferedSteps,
+      maxRuntime: userCfg.maxRuntime ?? defaultMaxRuntime,
+      maxInterval:
+        userCfg.maxInterval ?? defaultCheckpointingOptions.maxInterval,
+    };
+  }
+}
+
+/**
+ * A stateless Inngest function, wrapping up function configuration and any
+ * in-memory steps to run when triggered.
+ *
+ * This function can be "registered" to create a handler that Inngest can
+ * trigger remotely.
+ *
+ * @public
+ */
+export namespace InngestFunction {
+  export const Tag = "Inngest.Function" as const;
+
+  /**
+   * Represents any `InngestFunction` instance, regardless of generics and
+   * inference.
+   */
+  export type Any = InngestFunction<
+    // biome-ignore lint/suspicious/noExplicitAny: intentional
+    InngestFunction.Options<any, any>,
+    Handler.Any,
+    Handler.Any,
+    // biome-ignore lint/suspicious/noExplicitAny: intentional
+    any,
+    // biome-ignore lint/suspicious/noExplicitAny: intentional
+    any
+  >;
+
+  export interface Like {
+    readonly [Symbol.toStringTag]: typeof InngestFunction.Tag;
+  }
+
+  /**
+   * A user-friendly method of specifying a trigger for an Inngest function.
+   *
+   * @public
+   */
+  export type Trigger<TName extends string> = StrictUnion<
+    | {
+        event: TName | EventTypeWithAnySchema<TName>;
+        if?: string;
+      }
+    | {
+        cron: string;
+      }
+  >;
+
+  export type GetOptions<T extends InngestFunction.Any> =
+    // biome-ignore lint/suspicious/noExplicitAny: intentional
+    T extends InngestFunction<infer O, any, any, any, any> ? O : never;
+
+  /**
+   * A set of options for configuring an Inngest function.
+   *
+   * @public
+   */
+  export interface Options<
+    TTriggers extends
+      InngestFunction.Trigger<string>[] = InngestFunction.Trigger<string>[],
+    TFailureHandler extends Handler.Any = Handler.Any,
+  > {
+    triggers?: TTriggers;
+
+    /**
+     * An unique ID used to identify the function. This is used internally for
+     * versioning and referring to your function, so should not change between
+     * deployments.
+     *
+     * If you'd like to set a prettier name for your function, use the `name`
+     * option.
+     */
+    id: string;
+
+    /**
+     * A name for the function as it will appear in the Inngest Cloud UI.
+     */
+    name?: string;
+
+    /**
+     * A description of the function.
+     */
+    description?: string;
+
+    /**
+     * Concurrency specifies a limit on the total number of concurrent steps that
+     * can occur across all runs of the function.  A value of 0 (or undefined) means
+     * use the maximum available concurrency.
+     *
+     * Specifying just a number means specifying only the concurrency limit. A
+     * maximum of two concurrency options can be specified.
+     */
+    concurrency?:
+      | number
+      | ConcurrencyOption
+      | RecursiveTuple<ConcurrencyOption, 2>;
+
+    /**
+     * batchEvents specifies the batch configuration on when this function
+     * should be invoked when one of the requirements are fulfilled.
+     */
+    batchEvents?: {
+      /**
+       * The maximum number of events to be consumed in one batch.
+       * Check the pricing page to verify the limit for each plan.
+       */
+      maxSize: number;
+
+      /**
+       * How long to wait before invoking the function with a list of events.
+       * If timeout is reached, the function will be invoked with a batch
+       * even if it's not filled up to `maxSize`.
+       *
+       * Expects a time string such as 1s, 60s or 15m15s.
+       */
+      timeout: TimeStrBatch;
+
+      /**
+       * An optional key to use for batching.
+       *
+       * See [batch documentation](https://innge.st/batching) for more
+       * information on how to use `key` expressions.
+       */
+      key?: string;
+
+      /**
+       * An optional boolean expression to determine an event's eligibility for batching
+       *
+       * See [batch documentation](https://innge.st/batching) for more
+       * information on how to use `if` expressions.
+       */
+      if?: string;
+    };
+
+    /**
+     * Allow the specification of an idempotency key using event data. If
+     * specified, this overrides the `rateLimit` object.
+     */
+    idempotency?: string;
+
+    /**
+     * Rate limit function runs, only running them a given number of times (limit) per
+     * period.  Note that rate limit is a lossy, hard limit.  Once the limit is hit,
+     * new runs will be skipped.  To enqueue work when a rate limit is hit, use the
+     * {@link throttle} parameter.
+     */
+    rateLimit?: {
+      /**
+       * An optional key to use for rate limiting, similar to idempotency.
+       */
+      key?: string;
+
+      /**
+       * The number of times to allow the function to run per the given `period`.
+       */
+      limit: number;
+
+      /**
+       * The period of time to allow the function to run `limit` times.
+       */
+      period: TimeStr;
+    };
+
+    /**
+     * Throttles function runs, only running them a given number of times (limit) per
+     * period.  Once the limit is hit, new runs will be enqueued and will start when there's
+     * capacity.  This may lead to a large backlog.  For hard rate limiting, use the
+     * {@link rateLimit} parameter.
+     */
+    throttle?: {
+      /**
+       *  An optional expression which returns a throttling key for controlling throttling.
+       *  Every unique key is its own throttle limit.  Event data may be used within this
+       *  expression, eg "event.data.user_id".
+       */
+      key?: string;
+
+      /**
+       * The total number of runs allowed to start within the given `period`.  The limit is
+       * applied evenly over the period.
+       */
+      limit: number;
+
+      /**
+       * The period of time for the rate limit.  Run starts are evenly spaced through
+       * the given period.  The minimum granularity is 1 second.
+       */
+      period: TimeStr;
+
+      /**
+       * The number of runs allowed to start in the given window in a single burst.
+       * A burst > 1 bypasses smoothing for the burst and allows many runs to start
+       * at once, if desired.  Defaults to 1, which disables bursting.
+       */
+      burst?: number;
+    };
+
+    /**
+     * Debounce delays functions for the `period` specified. If an event is sent,
+     * the function will not run until at least `period` has elapsed.
+     *
+     * If any new events are received that match the same debounce `key`, the
+     * function is rescheduled for another `period` delay, and the triggering
+     * event is replaced with the latest event received.
+     *
+     * See the [Debounce documentation](https://innge.st/debounce) for more
+     * information.
+     */
+    debounce?: {
+      /**
+       * An optional key to use for debouncing.
+       *
+       * See [Debounce documentation](https://innge.st/debounce) for more
+       * information on how to use `key` expressions.
+       */
+      key?: string;
+
+      /**
+       * The period of time to delay after receiving the last trigger to run the
+       * function.
+       *
+       * See [Debounce documentation](https://innge.st/debounce) for more
+       * information.
+       */
+      period: TimeStr;
+
+      /**
+       * The maximum time that a debounce can be extended before running.
+       * If events are continually received within the given period, a function
+       * will always run after the given timeout period.
+       *
+       * See [Debounce documentation](https://innge.st/debounce) for more
+       * information.
+       */
+      timeout?: TimeStr;
+    };
+
+    /**
+     * Configure how the priority of a function run is decided when multiple
+     * functions are triggered at the same time.
+     *
+     * See the [Priority documentation](https://innge.st/priority) for more
+     * information.
+     */
+    priority?: {
+      /**
+       * An expression to use to determine the priority of a function run. The
+       * expression can return a number between `-600` and `600`, where `600`
+       * declares that this run should be executed before any others enqueued in
+       * the last 600 seconds (10 minutes), and `-600` declares that this run
+       * should be executed after any others enqueued in the last 600 seconds.
+       *
+       * See the [Priority documentation](https://innge.st/priority) for more
+       * information.
+       */
+      run?: string;
+    };
+
+    /**
+     * Configure timeouts for the function.  If any of the timeouts are hit, the
+     * function run will be cancelled.
+     */
+    timeouts?: {
+      /**
+       * Start represents the timeout for starting a function.  If the time
+       * between scheduling and starting a function exceeds this value, the
+       * function will be cancelled.
+       *
+       * This is, essentially, the amount of time that a function sits in the
+       * queue before starting.
+       *
+       * A function may exceed this duration because of concurrency limits,
+       * throttling, etc.
+       */
+      start?: TimeStr;
+
+      /**
+       * Finish represents the time between a function starting and the function
+       * finishing. If a function takes longer than this time to finish, the
+       * function is marked as cancelled.
+       *
+       * The start time is taken from the time that the first successful
+       * function request begins, and does not include the time spent in the
+       * queue before the function starts.
+       *
+       * Note that if the final request to a function begins before this
+       * timeout, and completes after this timeout, the function will succeed.
+       */
+      finish?: TimeStr;
+    };
+
+    /**
+     * Ensures that only one run of the function is active at a time for a given key.
+     * If a new run is triggered while another is still in progress with the same key,
+     * the new run will either be skipped or replace the active one, depending on the mode.
+     *
+     * This is useful for deduplication or enforcing exclusive execution.
+     */
+    singleton?: {
+      /**
+       * An optional key expression used to scope singleton execution.
+       * Each unique key has its own singleton lock. Event data can be referenced,
+       * e.g. "event.data.user_id".
+       */
+      key?: string;
+
+      /**
+       * Determines how to handle new runs when one is already active for the same key.
+       * - `"skip"` skips the new run.
+       * - `"cancel"` cancels the existing run and starts the new one.
+       */
+      mode: "skip" | "cancel";
+    };
+
+    cancelOn?: Cancellation[];
+
+    /**
+     * Specifies the maximum number of retries for all steps across this function.
+     *
+     * Can be a number from `0` to `20`. Defaults to `3`.
+     */
+    retries?:
+      | 0
+      | 1
+      | 2
+      | 3
+      | 4
+      | 5
+      | 6
+      | 7
+      | 8
+      | 9
+      | 10
+      | 11
+      | 12
+      | 13
+      | 14
+      | 15
+      | 16
+      | 17
+      | 18
+      | 19
+      | 20;
+
+    /**
+     * Provide a function to be called if your function fails, meaning
+     * that it ran out of retries and was unable to complete successfully.
+     *
+     * This is useful for sending warning notifications or cleaning up
+     * after a failure and supports all the same functionality as a
+     * regular handler.
+     */
+    onFailure?: TFailureHandler;
+
+    /**
+     * Define a set of middleware that can be registered to hook into
+     * various lifecycles of the SDK and affect input and output of
+     * Inngest functionality.
+     *
+     * See {@link https://innge.st/middleware}
+     */
+    middleware?: Middleware.Class[];
+
+    /**
+     * Optimizes parallel steps to reduce traffic during `Promise` resolution,
+     * reducing time and requests per run. `Promise.*()` waits for all promises
+     * to settle before resolving. Use `group.parallel()` for `Promise.race()`
+     * semantics.
+     *
+     * Overrides the client-level setting.
+     *
+     * @deprecated Use `group.parallel({ mode: "race" })` for race semantics
+     * instead.
+     * @default true
+     */
+    optimizeParallelism?: boolean;
+
+    /**
+     * Whether or not to use checkpointing for this function's executions.
+     *
+     * If `true`, enables checkpointing with default settings, which is a safe,
+     * blocking version of checkpointing, where we check in with Inngest after
+     * every step is run.
+     *
+     * If an object, you can tweak the settings to batch, set a maximum runtime
+     * before going async, and more. Note that if your server dies before the
+     * checkpoint completes, step data will be lost and steps will be rerun.
+     *
+     * We recommend starting with the default `true` configuration and only tweak
+     * the parameters directly if necessary.
+     *
+     * @deprecated Use `checkpointing` instead.
+     */
+    experimentalCheckpointing?: CheckpointingOptions;
+
+    /**
+     * Whether or not to use checkpointing for this function's executions.
+     *
+     * If `false`, disables checkpointing.
+     *
+     * If `true`, enables checkpointing with default settings, which is a safe,
+     * blocking version of checkpointing, where we check in with Inngest after
+     * every step is run.
+     *
+     * If an object, you can tweak the settings to batch, set a maximum runtime
+     * before going async, and more. Note that if your server dies before the
+     * checkpoint completes, step data will be lost and steps will be rerun.
+     *
+     * We recommend starting with the default `true` configuration and only tweak
+     * the parameters directly if necessary.
+     *
+     * @default true
+     */
+    checkpointing?: CheckpointingOptions;
+  }
+}
+
+export type CreateExecutionOptions = {
+  partialOptions: Omit<InngestExecutionOptions, "fn">;
+};

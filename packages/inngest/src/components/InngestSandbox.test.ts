@@ -1,0 +1,4103 @@
+import { Temporal } from "temporal-polyfill";
+
+import { envKeys } from "../helpers/consts.ts";
+import { hashSigningKey } from "../helpers/strings.ts";
+import {
+  createClient,
+  createFnRunner,
+  runFnWithStack,
+  testClientId,
+} from "../test/helpers.ts";
+import { StepOpCode } from "../types.ts";
+import { version } from "../version.ts";
+import { Inngest } from "./Inngest.ts";
+import {
+  createSandboxClient,
+  createSandboxTools,
+  encodeBase64,
+  getSandboxError,
+  parseSandboxOperation,
+  type SandboxCreateOptions,
+  SandboxError,
+  type SandboxOperationResultV1,
+  type SandboxOperationV1,
+  type SandboxProcessRef,
+  type SandboxRawTool,
+  type SandboxRef,
+  type SandboxSnapshotRef,
+  SandboxValidationError,
+  sandboxMiddleware,
+} from "./InngestSandbox.ts";
+import {
+  maxSandboxProcessTimeoutMs,
+  maxSandboxRunningTimeoutMs,
+  maxSandboxSnapshotWaitTimeoutMs,
+  normalizeSandboxCommandOptions,
+  normalizeSandboxCreateOptions,
+  normalizeSandboxProcessWaitOptions,
+  normalizeSandboxSnapshotWaitOptions,
+  normalizeSandboxWaitUntilRunningOptions,
+} from "./sandbox/validation.ts";
+
+const vpcId = "11111111-1111-4111-8111-111111111111";
+const sandboxId = "22222222-2222-4222-8222-222222222222";
+const processId = "33333333-3333-4333-8333-333333333333";
+const snapshotId = "44444444-4444-4444-8444-444444444444";
+const now = "2026-07-28T00:00:00Z";
+
+const sandboxRef = {
+  kind: "inngest/sandbox",
+  version: 1,
+  id: sandboxId,
+  name: "eval-run-1",
+  status: "RUNNING",
+  vpcId,
+  imageRef: "default",
+  resources: { vcpu: 2, memoryMb: 2048 },
+  createdAt: now,
+  startedAt: now,
+} satisfies SandboxRef;
+
+const processRef = {
+  kind: "inngest/sandbox.process",
+  version: 1,
+  sandboxId,
+  id: processId,
+  command: ["/bin/sh", "-lc", "sleep 30"],
+  pid: 42,
+  state: "RUNNING",
+  startedAt: now,
+} satisfies SandboxProcessRef;
+
+const snapshotRef = {
+  kind: "inngest/sandbox.snapshot",
+  version: 1,
+  id: snapshotId,
+  sourceImageId:
+    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  status: "READY",
+  compatibilityId: "simcity-linux-amd64-v1",
+  resources: { vcpu: 2, memoryMb: 2048 },
+  memoryPackCount: 8,
+  diskPackCount: 2,
+  storedBytes: 512,
+  createdAt: now,
+  updatedAt: now,
+  expiresAt: "2026-08-04T00:00:00Z",
+} satisfies SandboxSnapshotRef;
+
+const secretName = "OPENAI_API_KEY";
+
+const createOptions = {
+  secrets: [secretName],
+  name: sandboxRef.name,
+  vcpu: 2,
+  memoryMb: 2048,
+  environment: {
+    "1.WITH-DOT": "allowed",
+    SHARED: "sandbox",
+  },
+};
+
+const resultForOperation = (
+  operation: SandboxOperationV1,
+): SandboxOperationResultV1 => {
+  switch (operation.action) {
+    case "create":
+      return { protocolVersion: 1, action: "create", sandbox: sandboxRef };
+    case "list":
+      return {
+        protocolVersion: 1,
+        action: "list",
+        sandboxes: [sandboxRef],
+        page: { hasMore: false, limit: operation.input[0].limit },
+        fetchedAt: now,
+      };
+    case "get":
+      return { protocolVersion: 1, action: "get", sandbox: sandboxRef };
+    case "waitUntilRunning":
+      return {
+        protocolVersion: 1,
+        action: "waitUntilRunning",
+        sandbox: sandboxRef,
+      };
+    case "exec":
+      return {
+        protocolVersion: 1,
+        action: "exec",
+        result: {
+          stdout: "b2sK",
+          stderr: "",
+          encoding: "base64",
+          exitCode: 0,
+          output: { truncated: false },
+        },
+      };
+    case "file.upload":
+      return { protocolVersion: 1, action: "file.upload", result: null };
+    case "file.download":
+      return {
+        protocolVersion: 1,
+        action: "file.download",
+        result: { data: "" },
+      };
+    case "destroy":
+      return {
+        protocolVersion: 1,
+        action: "destroy",
+        result: {
+          status: "TERMINATING",
+          sandbox: { ...sandboxRef, status: "TERMINATING" },
+        },
+      };
+    case "pause":
+      return {
+        protocolVersion: 1,
+        action: "pause",
+        sandbox: { ...sandboxRef, status: "PAUSED" },
+      };
+    case "resume":
+      return { protocolVersion: 1, action: "resume", sandbox: sandboxRef };
+    case "process.start":
+      return {
+        protocolVersion: 1,
+        action: "process.start",
+        process: processRef,
+      };
+    case "process.list":
+      return {
+        protocolVersion: 1,
+        action: "process.list",
+        processes: [processRef],
+        page: { cursor: "next-process-page", hasMore: true, limit: 25 },
+        fetchedAt: now,
+      };
+    case "process.get":
+      return {
+        protocolVersion: 1,
+        action: "process.get",
+        process: processRef,
+      };
+    case "process.signal":
+      return {
+        protocolVersion: 1,
+        action: "process.signal",
+        result: null,
+      };
+    case "process.wait":
+      return {
+        protocolVersion: 1,
+        action: "process.wait",
+        process: {
+          kind: "inngest/sandbox.process",
+          version: 1,
+          sandboxId,
+          id: processId,
+          state: "KILLED",
+          terminationSignal: 15,
+        },
+      };
+    case "process.output":
+      return {
+        protocolVersion: 1,
+        action: "process.output",
+        result: {
+          chunks: [
+            {
+              stream: "STDOUT",
+              data: "AP8=",
+              encoding: "base64",
+              at: now,
+            },
+          ],
+        },
+      };
+    case "snapshot.create":
+      return {
+        protocolVersion: 1,
+        action: "snapshot.create",
+        snapshot: snapshotRef,
+      };
+    case "snapshot.list":
+      return {
+        protocolVersion: 1,
+        action: "snapshot.list",
+        snapshots: [snapshotRef],
+        page: { hasMore: false, limit: operation.input[0].limit },
+        fetchedAt: now,
+      };
+    case "snapshot.get":
+      return {
+        protocolVersion: 1,
+        action: "snapshot.get",
+        snapshot: snapshotRef,
+      };
+    case "snapshot.waitUntilReady":
+      return {
+        protocolVersion: 1,
+        action: "snapshot.waitUntilReady",
+        snapshot: snapshotRef,
+      };
+    case "snapshot.delete":
+      return {
+        protocolVersion: 1,
+        action: "snapshot.delete",
+        result: null,
+      };
+  }
+};
+
+describe("step.sandbox", () => {
+  test.each([
+    "inngest/base",
+    "inngest/base:latest",
+    "my-image:v1",
+    `my-image@sha256:${"a".repeat(64)}`,
+    `sha256:${"a".repeat(64)}`,
+  ])(
+    "preserves image selection and pinned digest in durable steps: %s",
+    async (image) => {
+      const imageDigest = `sha256:${"b".repeat(64)}`;
+      const rawTool = vi.fn<SandboxRawTool>(async (_id, operation) => {
+        if (operation.action === "create") {
+          return {
+            protocolVersion: 1,
+            action: "create",
+            sandbox: { ...sandboxRef, imageRef: image, imageDigest },
+          };
+        }
+        return resultForOperation(operation);
+      });
+      const created = await createSandboxTools(() => rawTool).create("create", {
+        ...createOptions,
+        image,
+      });
+      expect(created.imageDigest).toBe(imageDigest);
+      expect(parseSandboxOperation(rawTool.mock.calls[0]?.[1])).toMatchObject({
+        input: [{ image }],
+      });
+      await created.commands.run("exec", "echo ok");
+      expect(parseSandboxOperation(rawTool.mock.calls[1]?.[1])).toMatchObject({
+        target: { sandbox: { imageRef: image, imageDigest } },
+      });
+    },
+  );
+
+  test.each([
+    "",
+    "default",
+    "default:latest",
+    "docker.io/library/ubuntu:latest",
+    "My-image",
+    " image",
+    "image:latest\n",
+    "image:",
+    "sha256:abc",
+    `sha256:${"A".repeat(64)}`,
+    `image@sha256:${"a".repeat(63)}`,
+    "a".repeat(64),
+    `image:${"a".repeat(129)}`,
+  ])("rejects invalid image before dispatch: %j", async (image) => {
+    const rawTool = vi.fn<SandboxRawTool>();
+    const fetch = vi.fn();
+    const inngest = new Inngest({ id: "image-validation", isDev: true, fetch });
+    const options = { ...createOptions, image };
+    await expect(
+      createSandboxTools(() => rawTool).create("create", options),
+    ).rejects.toBeInstanceOf(SandboxValidationError);
+    await expect(inngest.sandboxes.create(options)).rejects.toBeInstanceOf(
+      SandboxValidationError,
+    );
+    expect(rawTool).not.toHaveBeenCalled();
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
+  test("rejects image selection for snapshot clones before dispatch", async () => {
+    const rawTool = vi.fn<SandboxRawTool>();
+    const fetch = vi.fn();
+    const inngest = new Inngest({
+      id: "clone-image-validation",
+      isDev: true,
+      fetch,
+    });
+    const options = { name: "clone", snapshotId, image: "inngest/base" };
+    await expect(
+      // @ts-expect-error snapshot clones must use the snapshot's pinned image
+      createSandboxTools(() => rawTool).create("create", options),
+    ).rejects.toBeInstanceOf(SandboxValidationError);
+    // @ts-expect-error the direct client has the same mutual exclusion
+    await expect(inngest.sandboxes.create(options)).rejects.toBeInstanceOf(
+      SandboxValidationError,
+    );
+    expect(rawTool).not.toHaveBeenCalled();
+    expect(fetch).not.toHaveBeenCalled();
+    expect(() =>
+      parseSandboxOperation({
+        protocolVersion: 1,
+        action: "create",
+        input: [options],
+      }),
+    ).toThrow();
+  });
+
+  test("uses UUID identity and exposes the complete durable lifecycle", async () => {
+    const operations: SandboxOperationV1[] = [];
+    const rawTool: SandboxRawTool = vi.fn(async (_id, operation) => {
+      operations.push(operation);
+      return resultForOperation(operation);
+    });
+    const tools = createSandboxTools(() => rawTool);
+
+    const created = await tools.create("create", {
+      ...createOptions,
+      runningTimeout: "5s",
+    });
+    const listed = await tools.list("list", { limit: 10 });
+    const fetched = await tools.get("get", sandboxId);
+    const shellCommand = `cd /workspace && printf '%s\n' "$HOME" | grep workspace > output.txt`;
+    const command = await created.commands.run("exec", shellCommand, {
+      environment: { "WITH.DOT": "allowed" },
+      timeout: Temporal.Duration.from({ seconds: 1 }),
+    });
+    const process = await created.processes.start("start", {
+      command: "sleep 30",
+      environment: { "1_NUMERIC": "also-allowed" },
+      cwd: "/workspace",
+    });
+    const processes = await created.processes.list("process-list", {
+      cursor: "process-cursor",
+      limit: 25,
+    });
+    await created.processes.get("process-get", processId);
+    await process.signal("signal", { signal: 15, includeChildren: true });
+    const waited = await process.wait("wait", { timeout: "5s" });
+    const output = await process.getOutput("output", { tailBytes: 123 });
+    const snapshot = await created.snapshots.create("snapshot-create");
+    const snapshots = await tools.snapshots.list("snapshot-list", { limit: 5 });
+    await tools.snapshots.get("snapshot-get", snapshotId);
+    const readySnapshot = await snapshot.waitUntilReady("snapshot-ready", {
+      timeout: "5s",
+    });
+    await snapshot.delete("snapshot-delete");
+    const clone = await snapshot.clone("clone", {
+      name: "snapshot-clone",
+    });
+    const running = await created.waitUntilRunning("wait-running", {
+      timeout: "5s",
+    });
+    const destroyed = await created.destroy("destroy");
+
+    expect(created).toMatchObject(sandboxRef);
+    expect(Object.isFrozen(created)).toBe(true);
+    expect(Object.isFrozen(created.resources)).toBe(true);
+    expect(Object.isFrozen(created.commands)).toBe(true);
+    expect("attach" in tools).toBe(false);
+    expect("toJSON" in created).toBe(false);
+    expect("toJSON" in process).toBe(false);
+    expect("refresh" in created).toBe(false);
+    expect("refresh" in process).toBe(false);
+    expect(listed.items[0]).toMatchObject(sandboxRef);
+    expect(fetched?.id).toBe(sandboxId);
+    expect(command).toEqual({
+      stdout: "ok\n",
+      stderr: "",
+      exitCode: 0,
+      output: { truncated: false },
+    });
+    expect(waited).toMatchObject({
+      id: processId,
+      state: "KILLED",
+      terminationSignal: 15,
+    });
+    expect(processes.items[0]).toMatchObject(processRef);
+    expect(processes.page).toEqual({
+      cursor: "next-process-page",
+      hasMore: true,
+      limit: 25,
+    });
+    expect(processes.fetchedAt).toBe(now);
+    expect(Object.isFrozen(waited)).toBe(true);
+    expect(Object.isFrozen(waited.command)).toBe(true);
+    expect(output.chunks[0]?.data).toEqual(new Uint8Array([0, 255]));
+    expect(snapshot).toMatchObject(snapshotRef);
+    expect(snapshots.items[0]).toMatchObject(snapshotRef);
+    expect(readySnapshot).toMatchObject(snapshotRef);
+    expect(Object.isFrozen(snapshot)).toBe(true);
+    expect(Object.isFrozen(snapshot.resources)).toBe(true);
+    expect("refresh" in snapshot).toBe(false);
+    expect(clone.id).toBe(sandboxId);
+    expect(running).toMatchObject({ id: sandboxId, status: "RUNNING" });
+    expect(destroyed).toMatchObject({ status: "TERMINATING" });
+
+    expect(operations.map(({ action }) => action)).toEqual([
+      "create",
+      "list",
+      "get",
+      "exec",
+      "process.start",
+      "process.list",
+      "process.get",
+      "process.signal",
+      "process.wait",
+      "process.output",
+      "snapshot.create",
+      "snapshot.waitUntilReady",
+      "snapshot.list",
+      "snapshot.get",
+      "snapshot.waitUntilReady",
+      "snapshot.delete",
+      "create",
+      "waitUntilRunning",
+      "destroy",
+    ]);
+    expect(operations[3]).toMatchObject({
+      action: "exec",
+      target: { sandbox: { id: sandboxId } },
+      input: [
+        {
+          command: ["/bin/sh", "-c", shellCommand],
+          environment: { "WITH.DOT": "allowed" },
+          timeoutMs: 1000,
+        },
+      ],
+    });
+    expect(operations[0]).toMatchObject({
+      action: "create",
+      input: [{ ...createOptions, runningTimeoutMs: 5000 }],
+    });
+    expect(operations[4]).toMatchObject({
+      action: "process.start",
+      target: { sandbox: { id: sandboxId } },
+      input: [{ command: ["/bin/sh", "-c", "sleep 30"] }],
+    });
+    expect(operations[5]).toMatchObject({
+      action: "process.list",
+      input: [{ cursor: "process-cursor", limit: 25 }],
+    });
+    expect(operations[7]).toMatchObject({
+      action: "process.signal",
+      target: {
+        sandbox: { id: sandboxId },
+        process: { sandboxId, id: processId },
+      },
+      input: [{ signal: 15, includeChildren: true }],
+    });
+    expect(operations[10]).toMatchObject({
+      action: "snapshot.create",
+      target: { sandbox: { id: sandboxId } },
+      input: [{}],
+    });
+    expect(operations[11]).toMatchObject({
+      action: "snapshot.waitUntilReady",
+      target: { snapshot: { id: snapshotId } },
+      input: [{ timeoutMs: 300_000 }],
+    });
+    expect(rawTool).toHaveBeenNthCalledWith(
+      11,
+      {
+        id: "snapshot-create",
+        name: "Create snapshot",
+        "~origin": `inngest@${version}`,
+      },
+      expect.objectContaining({ action: "snapshot.create" }),
+    );
+    expect(rawTool).toHaveBeenNthCalledWith(
+      12,
+      {
+        id: "snapshot-create:wait-until-ready",
+        name: "Wait for snapshot",
+        "~origin": `inngest@${version}`,
+      },
+      expect.objectContaining({ action: "snapshot.waitUntilReady" }),
+    );
+    expect(operations[16]).toMatchObject({
+      action: "create",
+      input: [{ name: "snapshot-clone", snapshotId }],
+    });
+    expect(operations[17]).toMatchObject({
+      action: "waitUntilRunning",
+      target: { sandbox: { id: sandboxId } },
+      input: [{ timeoutMs: 5000 }],
+    });
+  });
+
+  test("serializes default and disabled Create waiting", async () => {
+    const operations: SandboxOperationV1[] = [];
+    const rawTool: SandboxRawTool = vi.fn(async (_id, operation) => {
+      operations.push(operation);
+      return resultForOperation(operation);
+    });
+    const tools = createSandboxTools(() => rawTool);
+
+    await tools.create("create-default", createOptions);
+    await tools.create("create-immediate", {
+      ...createOptions,
+      runningTimeout: false,
+    });
+
+    expect(operations).toMatchObject([
+      {
+        action: "create",
+        input: [{ ...createOptions, runningTimeoutMs: 120_000 }],
+      },
+      {
+        action: "create",
+        input: [{ ...createOptions, runningTimeoutMs: false }],
+      },
+    ]);
+  });
+
+  test.each([
+    {
+      name: "create runningTimeout",
+      normalize: (timeout: string) => {
+        return normalizeSandboxCreateOptions({
+          ...createOptions,
+          runningTimeout: timeout,
+        });
+      },
+      maxMs: maxSandboxRunningTimeoutMs,
+    },
+    {
+      name: "waitUntilRunning timeout",
+      normalize: (timeout: string) => {
+        return normalizeSandboxWaitUntilRunningOptions({ timeout });
+      },
+      maxMs: maxSandboxRunningTimeoutMs,
+    },
+    {
+      name: "snapshot wait timeout",
+      normalize: (timeout: string) => {
+        return normalizeSandboxSnapshotWaitOptions({ timeout });
+      },
+      maxMs: maxSandboxSnapshotWaitTimeoutMs,
+    },
+    {
+      name: "command timeout",
+      normalize: (timeout: string) => {
+        return normalizeSandboxCommandOptions("true", { timeout });
+      },
+      maxMs: maxSandboxProcessTimeoutMs,
+    },
+    {
+      name: "process wait timeout",
+      normalize: (timeout: string) => {
+        return normalizeSandboxProcessWaitOptions({ timeout });
+      },
+      maxMs: maxSandboxProcessTimeoutMs,
+    },
+  ])("caps $name at the SDK maximum", ({ normalize, maxMs }) => {
+    expect(() => normalize("5m")).not.toThrow();
+    expect(() => normalize("4m 59s")).not.toThrow();
+    expect(() => normalize(`${maxMs + 1}ms`)).toThrow(
+      `must not exceed ${maxMs} milliseconds`,
+    );
+  });
+
+  test.each([
+    "OPENAI_API_KEY",
+    "openai-production",
+    "Mixed Case / token",
+    "__proto__",
+    "constructor",
+    "55555555-5555-4555-8555-555555555555",
+    "é".repeat(128),
+  ])("preserves exact secret name %s", async (name) => {
+    const secrets = [name];
+    const rawTool = vi.fn<SandboxRawTool>(async (_id, operation) =>
+      resultForOperation(operation),
+    );
+    await createSandboxTools(() => rawTool).create("create", {
+      ...createOptions,
+      secrets,
+    });
+    const operation = rawTool.mock.calls[0]?.[1];
+    expect(operation).toMatchObject({ input: [{ secrets }] });
+    expect(parseSandboxOperation(operation)).toMatchObject({
+      input: [{ secrets }],
+    });
+  });
+
+  test.each([
+    { secrets: [] },
+    { secrets: ["TOKEN_B", "TOKEN_A"] },
+    { secrets: ["token", "TOKEN"] },
+  ])(
+    "preserves a secret selection without aliases: %j",
+    async ({ secrets }) => {
+      const before = [...secrets];
+      const rawTool = vi.fn<SandboxRawTool>(async (_id, operation) =>
+        resultForOperation(operation),
+      );
+      await createSandboxTools(() => rawTool).create("create", {
+        ...createOptions,
+        secrets,
+      });
+      expect(secrets).toEqual(before);
+      expect(parseSandboxOperation(rawTool.mock.calls[0]?.[1])).toMatchObject({
+        input: [{ secrets }],
+      });
+    },
+  );
+
+  test("rejects invalid launch secret selections before dispatch", async () => {
+    const rawTool = vi.fn<SandboxRawTool>();
+    const tools = createSandboxTools(() => rawTool);
+    for (const secrets of [
+      [""],
+      [" leading"],
+      ["trailing\u0085"],
+      ["line\nfeed"],
+      ["carriage\rreturn"],
+      ["null\0byte"],
+      ["é".repeat(129)],
+      ["SHARED"],
+      ["BAD=KEY"],
+      [secretName, secretName],
+      Array.from({ length: 255 }, (_, i) => `TOKEN_${i}`),
+      Array.from({ length: 257 }, (_, i) => `TOKEN_${i}`),
+      { TOKEN: secretName },
+      secretName,
+      [123],
+    ]) {
+      await expect(
+        tools.create("create", {
+          ...createOptions,
+          secrets: secrets as unknown as string[],
+        }),
+      ).rejects.toBeInstanceOf(SandboxValidationError);
+      expect(() =>
+        parseSandboxOperation({
+          protocolVersion: 1,
+          action: "create",
+          input: [{ ...createOptions, secrets }],
+        }),
+      ).toThrow(SandboxValidationError);
+    }
+    expect(() =>
+      parseSandboxOperation({
+        protocolVersion: 1,
+        action: "create",
+        input: [{ name: "clone", snapshotId, secrets: [secretName] }],
+      }),
+    ).toThrow(SandboxValidationError);
+    expect(rawTool).not.toHaveBeenCalled();
+  });
+
+  test("validates Simcity limits without imposing identifier-style env keys", async () => {
+    const rawTool = vi.fn<SandboxRawTool>(async (_id, operation) =>
+      resultForOperation(operation),
+    );
+    const sandbox = await createSandboxTools(() => rawTool).get(
+      "get-sandbox",
+      sandboxId,
+    );
+    if (!sandbox) {
+      throw new Error("Expected sandbox");
+    }
+    rawTool.mockClear();
+
+    await expect(
+      createSandboxTools(() => rawTool).create("create", {
+        ...createOptions,
+        environment: { "": "invalid" },
+      }),
+    ).rejects.toBeInstanceOf(SandboxValidationError);
+    expect(() =>
+      parseSandboxOperation({
+        protocolVersion: 1,
+        action: "create",
+        input: [{ ...createOptions, environment: { "": "invalid" } }],
+      }),
+    ).toThrow(SandboxValidationError);
+
+    await expect(sandbox.commands.run("exec", "npm test")).resolves.toEqual({
+      stdout: "ok\n",
+      stderr: "",
+      exitCode: 0,
+      output: { truncated: false },
+    });
+    await sandbox.commands.run("argv", [
+      "/usr/bin/git",
+      "commit",
+      "-m",
+      "hello world",
+    ]);
+    expect(rawTool).toHaveBeenLastCalledWith(
+      "argv",
+      expect.objectContaining({
+        action: "exec",
+        input: [
+          expect.objectContaining({
+            command: ["/usr/bin/git", "commit", "-m", "hello world"],
+          }),
+        ],
+      }),
+    );
+    const widerOptions = {
+      command: "printf overridden",
+      cwd: "/workspace",
+    };
+    await sandbox.commands.run(
+      "explicit-command",
+      "printf explicit",
+      widerOptions,
+    );
+    expect(rawTool).toHaveBeenLastCalledWith(
+      "explicit-command",
+      expect.objectContaining({
+        action: "exec",
+        input: [
+          expect.objectContaining({
+            command: ["/bin/sh", "-c", "printf explicit"],
+            cwd: "/workspace",
+          }),
+        ],
+      }),
+    );
+    rawTool.mockClear();
+    await expect(sandbox.commands.run("empty", "")).rejects.toThrow(
+      "command must not be empty",
+    );
+    await expect(sandbox.commands.run("nul", "printf \0")).rejects.toThrow(
+      "must not contain NUL",
+    );
+    for (const command of [["npm", "test"], ["./script"], ["bin/script"]]) {
+      await sandbox.commands.run("exec", command);
+      expect(rawTool).toHaveBeenCalledWith(
+        expect.any(String),
+        expect.objectContaining({
+          input: [expect.objectContaining({ command })],
+        }),
+      );
+    }
+    rawTool.mockClear();
+    await expect(
+      sandbox.commands.run("too-large", "x".repeat(32_760)),
+    ).rejects.toThrow("must not exceed 32768 bytes");
+    await expect(sandbox.commands.run("exec", [""])).rejects.toThrow(
+      "command[0] must not be empty",
+    );
+    await expect(
+      sandbox.processes.start("start", {
+        command: ["/bin/true"],
+        environment: { "": "invalid" },
+      }),
+    ).rejects.toBeInstanceOf(SandboxValidationError);
+    expect(rawTool).not.toHaveBeenCalled();
+  });
+
+  test("accepts false for direct and durable Create and rejects invalid values", async () => {
+    const fetchMock = vi.fn<typeof fetch>();
+    const direct = createSandboxClient({
+      baseUrl: () => "https://api.example.test",
+      apiKey: () => "signkey-test",
+      headers: () => ({}),
+      fetch: () => fetchMock,
+    });
+    const rawTool = vi.fn<SandboxRawTool>();
+    const durable = createSandboxTools(() => rawTool);
+    const noWaitOptions: SandboxCreateOptions = {
+      ...createOptions,
+      runningTimeout: false,
+    };
+
+    const verifyCreateTypes = (): void => {
+      void direct.create(noWaitOptions);
+      void durable.create("create", noWaitOptions);
+      // @ts-expect-error runningTimeout only accepts a duration or false
+      void direct.create({ ...createOptions, runningTimeout: true });
+      void durable.create("create", {
+        ...createOptions,
+        // @ts-expect-error runningTimeout only accepts a duration or false
+        runningTimeout: true,
+      });
+    };
+    expect(verifyCreateTypes).toBeTypeOf("function");
+
+    await expect(
+      direct.create({ ...createOptions, runningTimeout: 0 }),
+    ).rejects.toBeInstanceOf(SandboxValidationError);
+    await expect(
+      durable.create("create-zero", { ...createOptions, runningTimeout: 0 }),
+    ).rejects.toBeInstanceOf(SandboxValidationError);
+    await expect(
+      direct.create({
+        ...createOptions,
+        runningTimeout: true,
+      } as unknown as Parameters<typeof direct.create>[0]),
+    ).rejects.toBeInstanceOf(SandboxValidationError);
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(rawTool).not.toHaveBeenCalled();
+  });
+
+  test("requires explicit middleware opt-in in function input types", () => {
+    const client = createClient({ id: testClientId, isDev: true });
+    type DirectCreateOptions = Parameters<typeof client.sandboxes.create>[0];
+    // @ts-expect-error cloning is exposed on a snapshot resource
+    const directClone: DirectCreateOptions = { name: "clone", snapshotId };
+    expect(directClone).toBeDefined();
+    const fn = client.createFunction(
+      { id: "sandbox-without-middleware" },
+      // @ts-expect-error step.sandbox is added by sandboxMiddleware
+      async ({ step }) => step.sandbox.list("list"),
+    );
+
+    expect(fn).toBeDefined();
+  });
+
+  test("suspends fresh process mutations and rehydrates them on replay", async () => {
+    const client = new Inngest({
+      id: testClientId,
+      isDev: true,
+      middleware: [sandboxMiddleware()],
+    });
+    const fn = client.createFunction(
+      { id: "sandbox-process", triggers: [{ event: "sandbox/process" }] },
+      async ({ step }) => {
+        const sandbox = await step.sandbox.create("create", createOptions);
+        const process = await sandbox.processes.start("start", {
+          command: "sleep 30",
+        });
+        await process.signal("signal", { signal: 15 });
+        return process.id;
+      },
+    );
+
+    const results: SandboxOperationResultV1[] = [
+      { protocolVersion: 1, action: "create", sandbox: sandboxRef },
+      {
+        protocolVersion: 1,
+        action: "process.start",
+        process: processRef,
+      },
+      {
+        protocolVersion: 1,
+        action: "process.signal",
+        result: null,
+      },
+    ];
+    const expectedActions = [
+      "create",
+      "process.start",
+      "process.signal",
+    ] as const;
+    const state: Record<string, { id: string; data: unknown }> = {};
+    const stackOrder: string[] = [];
+
+    for (const [index, action] of expectedActions.entries()) {
+      const invocation = await runFnWithStack(fn, state, {
+        stackOrder,
+        disableImmediateExecution: true,
+      });
+      expect(invocation.type).toBe("steps-found");
+      if (invocation.type !== "steps-found") {
+        throw new Error(`Expected steps-found, got ${invocation.type}`);
+      }
+      const outgoing = invocation.steps[0];
+      if (!outgoing) {
+        throw new Error(`Missing ${action} operation`);
+      }
+      expect(outgoing).toMatchObject({
+        op: StepOpCode.StepPlanned,
+        opts: {
+          input: [{ protocolVersion: 1, action }],
+        },
+      });
+      if (action === "process.start") {
+        expect(outgoing).toMatchObject({
+          opts: {
+            input: [{ input: [{ command: ["/bin/sh", "-c", "sleep 30"] }] }],
+          },
+        });
+      }
+      if (action === "process.signal") {
+        expect(outgoing).toMatchObject({
+          opts: {
+            input: [{ input: [{ signal: 15, includeChildren: true }] }],
+          },
+        });
+      }
+      state[outgoing.id] = { id: outgoing.id, data: results[index] };
+      stackOrder.push(outgoing.id);
+    }
+
+    await expect(
+      runFnWithStack(fn, state, {
+        stackOrder,
+        disableImmediateExecution: true,
+      }),
+    ).resolves.toMatchObject({
+      type: "function-resolved",
+      data: processId,
+    });
+  });
+
+  test("memoizes snapshot creation before replaying its readiness wait", async () => {
+    const client = new Inngest({
+      id: testClientId,
+      isDev: true,
+      middleware: [sandboxMiddleware()],
+    });
+    const fn = client.createFunction(
+      { id: "sandbox-snapshot", triggers: [{ event: "sandbox/snapshot" }] },
+      async ({ step }) => {
+        const sandbox = await step.sandbox.get("get-sandbox", sandboxId);
+        if (!sandbox) {
+          throw new Error("Expected sandbox");
+        }
+        return (await sandbox.snapshots.create("create-snapshot")).id;
+      },
+    );
+
+    const getInvocation = await runFnWithStack(
+      fn,
+      {},
+      {
+        disableImmediateExecution: true,
+      },
+    );
+    if (getInvocation.type !== "steps-found" || !getInvocation.steps[0]) {
+      throw new Error("Expected Get step");
+    }
+    const getStep = getInvocation.steps[0];
+    const state = {
+      [getStep.id]: {
+        id: getStep.id,
+        data: { protocolVersion: 1, action: "get", sandbox: sandboxRef },
+      },
+    };
+    const stackOrder = [getStep.id];
+
+    const first = await runFnWithStack(fn, state, {
+      stackOrder,
+      disableImmediateExecution: true,
+    });
+    const replay = await runFnWithStack(fn, state, {
+      stackOrder,
+      disableImmediateExecution: true,
+    });
+    if (
+      first.type !== "steps-found" ||
+      replay.type !== "steps-found" ||
+      !first.steps[0] ||
+      !replay.steps[0]
+    ) {
+      throw new Error("Expected snapshot Create step");
+    }
+    const firstStep = first.steps[0];
+    const replayStep = replay.steps[0];
+    if (!firstStep.opts || !replayStep.opts) {
+      throw new Error("Expected snapshot Create step options");
+    }
+    expect(firstStep.opts.input).toEqual(replayStep.opts.input);
+    expect(firstStep).toMatchObject({
+      opts: {
+        input: [
+          {
+            protocolVersion: 1,
+            action: "snapshot.create",
+            target: { sandbox: { id: sandboxId } },
+            input: [{}],
+          },
+        ],
+      },
+    });
+
+    const createdState = {
+      ...state,
+      [firstStep.id]: {
+        id: firstStep.id,
+        data: {
+          protocolVersion: 1,
+          action: "snapshot.create" as const,
+          snapshot: snapshotRef,
+        },
+      },
+    };
+    const createdStackOrder = [...stackOrder, firstStep.id];
+    const firstWait = await runFnWithStack(fn, createdState, {
+      stackOrder: createdStackOrder,
+      disableImmediateExecution: true,
+    });
+    const replayedWait = await runFnWithStack(fn, createdState, {
+      stackOrder: createdStackOrder,
+      disableImmediateExecution: true,
+    });
+    if (
+      firstWait.type !== "steps-found" ||
+      replayedWait.type !== "steps-found" ||
+      !firstWait.steps[0] ||
+      !replayedWait.steps[0]
+    ) {
+      throw new Error("Expected snapshot readiness step");
+    }
+    const waitStep = firstWait.steps[0];
+    expect(replayedWait.steps[0].id).toBe(waitStep.id);
+    expect(waitStep).toMatchObject({
+      opts: {
+        input: [
+          {
+            protocolVersion: 1,
+            action: "snapshot.waitUntilReady",
+            target: { snapshot: { id: snapshotId } },
+            input: [{ timeoutMs: 300_000 }],
+          },
+        ],
+      },
+    });
+
+    await expect(
+      runFnWithStack(
+        fn,
+        {
+          ...createdState,
+          [waitStep.id]: {
+            id: waitStep.id,
+            data: {
+              protocolVersion: 1,
+              action: "snapshot.waitUntilReady",
+              snapshot: snapshotRef,
+            },
+          },
+        },
+        {
+          stackOrder: [...createdStackOrder, waitStep.id],
+          disableImmediateExecution: true,
+        },
+      ),
+    ).resolves.toMatchObject({
+      type: "function-resolved",
+      data: snapshotId,
+    });
+  });
+
+  test("suspends waitUntilRunning and rehydrates its RUNNING result on replay", async () => {
+    const startingSandboxRef = {
+      ...sandboxRef,
+      status: "STARTING",
+      startedAt: undefined,
+    } satisfies SandboxRef;
+    const client = new Inngest({
+      id: testClientId,
+      isDev: true,
+      middleware: [sandboxMiddleware()],
+    });
+    const fn = client.createFunction(
+      {
+        id: "sandbox-wait-until-running",
+        triggers: [{ event: "sandbox/wait-until-running" }],
+      },
+      async ({ step }) => {
+        const sandbox = await step.sandbox.get("get", sandboxId);
+        if (!sandbox) {
+          throw new Error("Expected sandbox");
+        }
+        return (
+          await sandbox.waitUntilRunning("wait-running", { timeout: "5s" })
+        ).status;
+      },
+    );
+
+    const getInvocation = await runFnWithStack(
+      fn,
+      {},
+      {
+        disableImmediateExecution: true,
+      },
+    );
+    expect(getInvocation).toMatchObject({
+      type: "steps-found",
+      steps: [
+        {
+          opts: {
+            input: [{ protocolVersion: 1, action: "get" }],
+          },
+        },
+      ],
+    });
+    if (getInvocation.type !== "steps-found" || !getInvocation.steps[0]) {
+      throw new Error("Expected Get step");
+    }
+
+    const getStep = getInvocation.steps[0];
+    const waitInvocation = await runFnWithStack(
+      fn,
+      {
+        [getStep.id]: {
+          id: getStep.id,
+          data: {
+            protocolVersion: 1,
+            action: "get",
+            sandbox: startingSandboxRef,
+          },
+        },
+      },
+      {
+        stackOrder: [getStep.id],
+        disableImmediateExecution: true,
+      },
+    );
+    expect(waitInvocation).toMatchObject({
+      type: "steps-found",
+      steps: [
+        {
+          opts: {
+            input: [
+              {
+                protocolVersion: 1,
+                action: "waitUntilRunning",
+                target: { sandbox: { id: sandboxId, status: "STARTING" } },
+                input: [{ timeoutMs: 5000 }],
+              },
+            ],
+          },
+        },
+      ],
+    });
+    if (waitInvocation.type !== "steps-found" || !waitInvocation.steps[0]) {
+      throw new Error("Expected waitUntilRunning step");
+    }
+
+    const waitStep = waitInvocation.steps[0];
+    await expect(
+      runFnWithStack(
+        fn,
+        {
+          [getStep.id]: {
+            id: getStep.id,
+            data: {
+              protocolVersion: 1,
+              action: "get",
+              sandbox: startingSandboxRef,
+            },
+          },
+          [waitStep.id]: {
+            id: waitStep.id,
+            data: {
+              protocolVersion: 1,
+              action: "waitUntilRunning",
+              sandbox: sandboxRef,
+            },
+          },
+        },
+        { stackOrder: [getStep.id, waitStep.id] },
+      ),
+    ).resolves.toMatchObject({
+      type: "function-resolved",
+      data: "RUNNING",
+    });
+  });
+
+  test.each([undefined, "inngest/base:latest"])(
+    "durable Create waits and replays without redispatching (%s)",
+    async (image) => {
+      const resolved = {
+        ...sandboxRef,
+        ...(image !== undefined && {
+          imageRef: image,
+          imageDigest: `sha256:${"a".repeat(64)}`,
+        }),
+      };
+      const { kind: _kind, version: _version, ...sandboxResource } = resolved;
+      const startingResource = {
+        ...sandboxResource,
+        status: "STARTING",
+        startedAt: undefined,
+      };
+      const methods: string[] = [];
+      const fetchMock: typeof fetch = vi.fn(async (_input, init) => {
+        const method = init?.method ?? "GET";
+        methods.push(method);
+        return method === "POST"
+          ? Response.json({ data: startingResource }, { status: 202 })
+          : Response.json({ data: sandboxResource });
+      });
+      const client = new Inngest({
+        id: testClientId,
+        signingKey: "signkey-test",
+        baseUrl: "https://api.example.test",
+        fetch: fetchMock,
+        middleware: [sandboxMiddleware()],
+      });
+      const fn = client.createFunction(
+        { id: "sandbox-create", triggers: [{ event: "sandbox/create" }] },
+        async ({ step }) => {
+          const sandbox = await step.sandbox.create("create", {
+            ...createOptions,
+            ...(image !== undefined && { image }),
+          });
+          return { id: sandbox.id, imageDigest: sandbox.imageDigest };
+        },
+      );
+      const run = createFnRunner(fn);
+
+      const first = await run();
+      expect(first.result).toMatchObject({
+        type: "step-ran",
+        step: {
+          op: StepOpCode.StepRun,
+          data: {
+            protocolVersion: 1,
+            action: "create",
+            sandbox: resolved,
+          },
+        },
+      });
+      expect(methods).toEqual(["POST", "GET"]);
+
+      const replay = await run();
+      expect(replay.result).toMatchObject({
+        type: "function-resolved",
+        data: {
+          id: sandboxId,
+          ...(image !== undefined && { imageDigest: resolved.imageDigest }),
+        },
+      });
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+    },
+  );
+
+  test("executes durable snapshot creation once before polling readiness", async () => {
+    const { kind: _kind, version: _version, ...sandboxResource } = sandboxRef;
+    const {
+      kind: _snapshotKind,
+      version: _snapshotVersion,
+      ...snapshotResource
+    } = snapshotRef;
+    const requests: Array<{ url: URL; init?: RequestInit }> = [];
+    const fetchMock: typeof fetch = vi.fn(async (input, init) => {
+      const url = new URL(input instanceof Request ? input.url : input);
+      requests.push({ url, init });
+      if (url.pathname === `/v2/sandboxes/${sandboxId}`) {
+        return Response.json({ data: sandboxResource });
+      }
+      if (url.pathname === `/v2/sandboxes/${sandboxId}/snapshots`) {
+        return Response.json(
+          {
+            data: {
+              ...snapshotResource,
+              sourceImageId:
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              status: "CREATING",
+              compatibilityId: undefined,
+            },
+          },
+          { status: 202 },
+        );
+      }
+      if (url.pathname === `/v2/snapshots/${snapshotId}`) {
+        return Response.json({ data: snapshotResource });
+      }
+      return Response.json(
+        { errors: [{ code: "missing", message: "missing" }] },
+        { status: 404 },
+      );
+    });
+    const client = new Inngest({
+      id: testClientId,
+      signingKey: "signkey-test",
+      baseUrl: "https://api.example.test",
+      fetch: fetchMock,
+      middleware: [sandboxMiddleware()],
+    });
+    const fn = client.createFunction(
+      {
+        id: "sandbox-snapshot-rest",
+        triggers: [{ event: "sandbox/snapshot-rest" }],
+      },
+      async ({ step }) => {
+        const sandbox = await step.sandbox.get("get-sandbox", sandboxId);
+        if (!sandbox) {
+          throw new Error("Expected sandbox");
+        }
+        return (await sandbox.snapshots.create("create-snapshot")).id;
+      },
+    );
+    const run = createFnRunner(fn);
+
+    await run();
+    await run();
+    await run();
+    const replay = await run();
+
+    expect(replay.result).toMatchObject({
+      type: "function-resolved",
+      data: snapshotId,
+    });
+    expect(requests).toHaveLength(3);
+    expect(requests.filter(({ init }) => init?.method === "POST")).toHaveLength(
+      1,
+    );
+    expect(requests[1]?.init).toMatchObject({ method: "POST" });
+    // Cloud rejects any body on this route, even `{}`.
+    expect(requests[1]?.init?.body).toBeUndefined();
+    expect("snapshots" in client.sandboxes).toBe(true);
+  });
+
+  test("carries a snapshot name through durable create and list steps", async () => {
+    const { kind: _kind, version: _version, ...sandboxResource } = sandboxRef;
+    const {
+      kind: _snapshotKind,
+      version: _snapshotVersion,
+      ...snapshotResource
+    } = snapshotRef;
+    const namedResource = { ...snapshotResource, name: "base" };
+    const requests: Array<{ url: URL; init?: RequestInit }> = [];
+    const fetchMock: typeof fetch = vi.fn(async (input, init) => {
+      const url = new URL(input instanceof Request ? input.url : input);
+      requests.push({ url, init });
+      if (url.pathname === `/v2/sandboxes/${sandboxId}`) {
+        return Response.json({ data: sandboxResource });
+      }
+      if (url.pathname === `/v2/sandboxes/${sandboxId}/snapshots`) {
+        return Response.json({ data: namedResource }, { status: 201 });
+      }
+      if (url.pathname === `/v2/snapshots/${snapshotId}`) {
+        return Response.json({ data: namedResource });
+      }
+      if (url.pathname === "/v2/snapshots") {
+        return Response.json({
+          data: [namedResource],
+          metadata: { fetchedAt: now },
+          page: { hasMore: false, limit: 50 },
+        });
+      }
+      return Response.json(
+        { errors: [{ code: "missing", message: "missing" }] },
+        { status: 404 },
+      );
+    });
+    const client = new Inngest({
+      id: testClientId,
+      signingKey: "signkey-test",
+      baseUrl: "https://api.example.test",
+      fetch: fetchMock,
+      middleware: [sandboxMiddleware()],
+    });
+    const fn = client.createFunction(
+      {
+        id: "sandbox-named-snapshot",
+        triggers: [{ event: "sandbox/named-snapshot" }],
+      },
+      async ({ step }) => {
+        const sandbox = await step.sandbox.get("get-sandbox", sandboxId);
+        if (!sandbox) {
+          throw new Error("Expected sandbox");
+        }
+        const created = await sandbox.snapshot("create-snapshot", {
+          name: "base",
+        });
+        const listed = await step.sandbox.snapshots.list("list-snapshots", {
+          name: "base",
+        });
+        return {
+          created: created.name,
+          listed: listed.items.map((snapshot) => snapshot.name),
+        };
+      },
+    );
+    const run = createFnRunner(fn);
+
+    await run();
+    const createRun = await run();
+    await run();
+    await run();
+    const replay = await run();
+
+    expect(createRun.result).toMatchObject({
+      type: "step-ran",
+      step: {
+        opts: {
+          input: [
+            {
+              action: "snapshot.create",
+              input: [{ name: "base" }],
+            },
+          ],
+        },
+      },
+    });
+    expect(replay.result).toMatchObject({
+      type: "function-resolved",
+      data: { created: "base", listed: ["base"] },
+    });
+    const post = requests.find(({ init }) => init?.method === "POST");
+    expect(JSON.parse(String(post?.init?.body))).toEqual({ name: "base" });
+    const list = requests.find(({ url }) => url.pathname === "/v2/snapshots");
+    expect(list?.url.searchParams.get("name")).toBe("base");
+  });
+
+  test("keeps larger direct Exec results but tail-truncates them at the durable step boundary", async () => {
+    const stdoutBytes = new Uint8Array(3 << 20);
+    stdoutBytes.set([1, 2, 3]);
+    stdoutBytes.set([0xe2, 0x82, 0xac], (2 << 20) - 1);
+    const stderrBytes = new Uint8Array(1 << 20);
+    const threeMiBBase64 = encodeBase64(stdoutBytes);
+    const oneMiBBase64 = encodeBase64(stderrBytes);
+    const { kind: _kind, version: _version, ...sandboxResource } = sandboxRef;
+    const execBodies: unknown[] = [];
+    const fetchMock: typeof fetch = vi.fn(async (input, init) => {
+      const url = new URL(input instanceof Request ? input.url : input);
+      if (
+        url.pathname === `/v2/sandboxes/${sandboxId}` &&
+        (init?.method ?? "GET") === "GET"
+      ) {
+        return Response.json({ data: sandboxResource });
+      }
+      if (url.pathname.endsWith("/exec")) {
+        execBodies.push(JSON.parse(String(init?.body)));
+      }
+      return Response.json({
+        data: {
+          stdout: threeMiBBase64,
+          stderr: oneMiBBase64,
+          encoding: "base64",
+          exitCode: 0,
+        },
+      });
+    });
+    const client = new Inngest({
+      id: testClientId,
+      signingKey: "signkey-test",
+      baseUrl: "https://api.example.test",
+      fetch: fetchMock,
+      middleware: [sandboxMiddleware()],
+    });
+
+    const directSandbox = await client.sandboxes.get(sandboxId);
+    if (!directSandbox) {
+      throw new Error("Expected sandbox");
+    }
+    const direct = await directSandbox.commands.run("printf ok", {
+      cwd: "/workspace",
+      environment: { CI: "true" },
+      timeout: "5m",
+    });
+    expect(direct.stdout.startsWith("\u0001\u0002\u0003")).toBe(true);
+    expect(direct.stdout).toContain("€");
+    expect(direct.stderr).toHaveLength(1 << 20);
+    expect(direct.output).toEqual({ truncated: false });
+
+    const fn = client.createFunction(
+      { id: "sandbox-exec-limit", triggers: [{ event: "sandbox/exec-limit" }] },
+      async ({ step }) => {
+        const sandbox = await step.sandbox.get("get-sandbox", sandboxId);
+        if (!sandbox) {
+          throw new Error("Expected sandbox");
+        }
+        const result = await sandbox.commands.run("exec", "printf ok", {
+          cwd: "/workspace",
+          environment: { CI: "true" },
+          timeout: "5m",
+        });
+        return {
+          stdoutStartsWithReplacement: result.stdout.startsWith("\uFFFD"),
+          stderrLength: result.stderr.length,
+          output: result.output,
+        };
+      },
+    );
+
+    const getStep = await runFnWithStack(fn, {});
+    expect(getStep).toMatchObject({
+      type: "step-ran",
+      step: {
+        op: StepOpCode.StepRun,
+        data: {
+          protocolVersion: 1,
+          action: "get",
+          sandbox: sandboxRef,
+        },
+      },
+    });
+    if (getStep.type !== "step-ran") {
+      throw new Error(`Expected step-ran, got ${getStep.type}`);
+    }
+    const getState = {
+      [getStep.step.id]: {
+        id: getStep.step.id,
+        data: getStep.step.data,
+      },
+    };
+    const execStep = await runFnWithStack(fn, getState, {
+      stackOrder: [getStep.step.id],
+    });
+    expect(execStep).toMatchObject({
+      type: "step-ran",
+      step: {
+        op: StepOpCode.StepRun,
+        data: {
+          protocolVersion: 1,
+          action: "exec",
+          result: {
+            output: {
+              truncated: true,
+              strategy: "tail",
+              originalBytes: {
+                stdout: 3 << 20,
+                stderr: 1 << 20,
+              },
+              retainedBytes: {
+                stdout: 1 << 20,
+                stderr: 1 << 20,
+              },
+            },
+          },
+        },
+      },
+    });
+    if (execStep.type !== "step-ran") {
+      throw new Error(`Expected step-ran, got ${execStep.type}`);
+    }
+
+    await expect(
+      runFnWithStack(
+        fn,
+        {
+          ...getState,
+          [execStep.step.id]: {
+            id: execStep.step.id,
+            data: execStep.step.data,
+          },
+        },
+        { stackOrder: [getStep.step.id, execStep.step.id] },
+      ),
+    ).resolves.toMatchObject({
+      type: "function-resolved",
+      data: {
+        stdoutStartsWithReplacement: true,
+        stderrLength: 1 << 20,
+        output: {
+          truncated: true,
+          strategy: "tail",
+          originalBytes: {
+            stdout: 3 << 20,
+            stderr: 1 << 20,
+          },
+          retainedBytes: {
+            stdout: 1 << 20,
+            stderr: 1 << 20,
+          },
+        },
+      },
+    });
+    expect(fetchMock).toHaveBeenCalledTimes(4);
+    expect(execBodies).toEqual([
+      {
+        command: ["/bin/sh", "-c", "printf ok"],
+        cwd: "/workspace",
+        environment: { CI: "true" },
+        timeout: "300000ms",
+      },
+      {
+        command: ["/bin/sh", "-c", "printf ok"],
+        cwd: "/workspace",
+        environment: { CI: "true" },
+        timeout: "300000ms",
+      },
+    ]);
+  });
+
+  test("retries a structured Create availability failure", async () => {
+    const fetchMock: typeof fetch = vi.fn(async () =>
+      Response.json(
+        {
+          errors: [
+            {
+              code: "compute_unavailable",
+              message: "Compute is temporarily unavailable",
+            },
+          ],
+        },
+        { status: 503 },
+      ),
+    );
+    const client = new Inngest({
+      id: testClientId,
+      signingKey: "signkey-test",
+      baseUrl: "https://api.example.test",
+      fetch: fetchMock,
+      middleware: [sandboxMiddleware()],
+    });
+    const fn = client.createFunction(
+      { id: "sandbox-error", triggers: [{ event: "sandbox/error" }] },
+      async ({ step }) => {
+        try {
+          await step.sandbox.create("create", createOptions);
+          return null;
+        } catch (error) {
+          const sandboxError = getSandboxError(error);
+          return sandboxError
+            ? {
+                name: sandboxError.name,
+                action: sandboxError.action,
+                code: sandboxError.code,
+                ambiguous: sandboxError.ambiguous,
+                retryable: sandboxError.retryable,
+              }
+            : {
+                name: error instanceof Error ? error.name : typeof error,
+                message: error instanceof Error ? error.message : String(error),
+              };
+        }
+      },
+    );
+
+    const first = await runFnWithStack(fn, {});
+    expect(first).toMatchObject({
+      type: "step-ran",
+      retriable: true,
+      step: {
+        op: StepOpCode.StepError,
+      },
+    });
+    if (first.type !== "step-ran") {
+      throw new Error(`Expected step-ran, got ${first.type}`);
+    }
+
+    const replay = await runFnWithStack(
+      fn,
+      {
+        [first.step.id]: {
+          id: first.step.id,
+          data: undefined,
+          error: first.step.error,
+        },
+      },
+      { stackOrder: [first.step.id] },
+    );
+    expect(replay).toMatchObject({
+      type: "function-resolved",
+      data: {
+        name: "SandboxError",
+        action: "create",
+        code: "compute_unavailable",
+        ambiguous: false,
+        retryable: true,
+      },
+    });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  test.each(["list", "create"] as const)(
+    "keeps %s transport failures retryable and reconstructs them after exhaustion",
+    async (action) => {
+      const fetchMock: typeof fetch = vi.fn(async () => {
+        throw new TypeError("connection refused");
+      });
+      const client = new Inngest({
+        id: testClientId,
+        signingKey: "signkey-test",
+        baseUrl: "https://api.example.test",
+        fetch: fetchMock,
+        middleware: [sandboxMiddleware()],
+      });
+      const fn = client.createFunction(
+        {
+          id: `sandbox-retryable-${action}-error`,
+          triggers: [{ event: `sandbox/retryable-${action}-error` }],
+        },
+        async ({ step }) => {
+          try {
+            if (action === "create") {
+              await step.sandbox.create("create", createOptions);
+            } else {
+              await step.sandbox.list("list");
+            }
+            return null;
+          } catch (error) {
+            const sandboxError = getSandboxError(error);
+            return sandboxError
+              ? {
+                  name: sandboxError.name,
+                  action: sandboxError.action,
+                  code: sandboxError.code,
+                  ambiguous: sandboxError.ambiguous,
+                  retryable: sandboxError.retryable,
+                }
+              : {
+                  name: error instanceof Error ? error.name : typeof error,
+                };
+          }
+        },
+      );
+
+      const first = await runFnWithStack(fn, {});
+      expect(first).toMatchObject({
+        type: "step-ran",
+        retriable: true,
+        step: {
+          op: StepOpCode.StepError,
+        },
+      });
+      if (first.type !== "step-ran") {
+        throw new Error(`Expected step-ran, got ${first.type}`);
+      }
+
+      const replay = await runFnWithStack(
+        fn,
+        {
+          [first.step.id]: {
+            id: first.step.id,
+            data: undefined,
+            error: first.step.error,
+          },
+        },
+        { stackOrder: [first.step.id] },
+      );
+      expect(replay).toMatchObject({
+        type: "function-resolved",
+        data: {
+          name: "SandboxError",
+          action,
+          code: "compute_unavailable",
+          ambiguous: false,
+          retryable: true,
+        },
+      });
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+    },
+  );
+
+  describe("a failed sandbox step behaves like any other failed step", () => {
+    const createFailingFn = (
+      status: number,
+      code: string,
+      handler: (list: () => Promise<unknown>) => Promise<unknown>,
+    ) => {
+      const fetchMock: typeof fetch = vi.fn(async () =>
+        Response.json(
+          { errors: [{ code, message: "List failed" }] },
+          { status },
+        ),
+      );
+      const client = new Inngest({
+        id: testClientId,
+        signingKey: "signkey-test",
+        baseUrl: "https://api.example.test",
+        fetch: fetchMock,
+        middleware: [sandboxMiddleware()],
+      });
+      return client.createFunction(
+        { id: `sandbox-list-${status}`, triggers: [{ event: "sandbox/list" }] },
+        async ({ step }) => handler(() => step.sandbox.list("list")),
+      );
+    };
+
+    const replayFailedStep = async (fn: ReturnType<typeof createFailingFn>) => {
+      const first = await runFnWithStack(fn, {});
+      if (first.type !== "step-ran") {
+        throw new Error(`Expected step-ran, got ${first.type}`);
+      }
+      return runFnWithStack(
+        fn,
+        {
+          [first.step.id]: {
+            id: first.step.id,
+            data: undefined,
+            error: first.step.error,
+          },
+        },
+        { stackOrder: [first.step.id] },
+      );
+    };
+
+    test.each([
+      [403, "sandbox_snapshot_limit_exceeded"],
+      [503, "compute_unavailable"],
+    ] as const)(
+      "does not retry the function when a %i failure is uncaught",
+      async (status, code) => {
+        const fn = createFailingFn(status, code, (list) => list());
+
+        const replay = await replayFailedStep(fn);
+        expect(replay).toMatchObject({
+          type: "function-rejected",
+          retriable: false,
+        });
+        if (replay.type !== "function-rejected") {
+          throw new Error(`Expected function-rejected, got ${replay.type}`);
+        }
+        expect(getSandboxError(replay.error)).toMatchObject({
+          action: "list",
+          code,
+        });
+      },
+    );
+
+    test("retries the function when the failure is caught and another error is thrown", async () => {
+      const fn = createFailingFn(
+        403,
+        "sandbox_snapshot_limit_exceeded",
+        async (list) => {
+          try {
+            return await list();
+          } catch (error) {
+            throw new Error("Retrying after a sandbox failure", {
+              cause: error,
+            });
+          }
+        },
+      );
+
+      const replay = await replayFailedStep(fn);
+      expect(replay).toMatchObject({
+        type: "function-rejected",
+        retriable: true,
+      });
+    });
+  });
+
+  test("maps a structured executor failure without making all errors non-retriable", async () => {
+    const rawTool: SandboxRawTool = async (_id, operation) => {
+      if (operation.action === "get") {
+        return resultForOperation(operation);
+      }
+      throw {
+        cause: {
+          protocolVersion: 1,
+          action: "process.start",
+          code: "operation_ambiguous",
+          message: "Result is ambiguous",
+          sandboxId,
+          ambiguous: true,
+          retryable: false,
+          details: [],
+        },
+      };
+    };
+    const sandbox = await createSandboxTools(() => rawTool).get(
+      "get-sandbox",
+      sandboxId,
+    );
+    if (!sandbox) {
+      throw new Error("Expected sandbox");
+    }
+    const error = await sandbox.processes
+      .start("start", { command: ["/bin/true"] })
+      .catch((value: unknown) => value);
+
+    expect(error).toBeInstanceOf(SandboxError);
+    expect(error).toMatchObject({
+      action: "process.start",
+      code: "operation_ambiguous",
+      sandboxId,
+      ambiguous: true,
+      retryable: false,
+    });
+  });
+});
+
+describe("step.sandbox environment values", () => {
+  test("commands.run records the keys only and still sends the values", async () => {
+    const token = "ghp_super_secret_value";
+    const { kind: _kind, version: _version, ...sandboxResource } = sandboxRef;
+    const bodies: string[] = [];
+    const fetchMock: typeof fetch = vi.fn(async (input, init) => {
+      const url = new URL(input instanceof Request ? input.url : input);
+      if (url.pathname === `/v2/sandboxes/${sandboxId}/exec`) {
+        bodies.push(String(init?.body));
+        return Response.json({
+          data: { stdout: "", stderr: "", exit_code: 0 },
+        });
+      }
+      return Response.json({ data: sandboxResource });
+    });
+    const client = new Inngest({
+      id: testClientId,
+      signingKey: "signkey-test",
+      baseUrl: "https://api.example.test",
+      fetch: fetchMock,
+      middleware: [sandboxMiddleware()],
+    });
+    const fn = client.createFunction(
+      { id: "sandbox-env", triggers: [{ event: "sandbox/env" }] },
+      async ({ step }) => {
+        const sandbox = await step.sandbox.get("get", sandboxId);
+        await sandbox?.commands.run("run", "env", {
+          environment: { TOKEN: token },
+        });
+      },
+    );
+    const getRun = await runFnWithStack(fn, {});
+    if (getRun.type !== "step-ran") {
+      throw new Error(`Expected step-ran, got ${getRun.type}`);
+    }
+    const state = {
+      [getRun.step.id]: { id: getRun.step.id, data: getRun.step.data },
+    };
+
+    const planned = await runFnWithStack(fn, state, {
+      disableImmediateExecution: true,
+    });
+    if (planned.type !== "steps-found" || !planned.steps[0]) {
+      throw new Error("Expected a planned step");
+    }
+    const step = planned.steps[0];
+    expect(JSON.stringify(step)).not.toContain(token);
+    expect(JSON.stringify(step.opts?.input)).toContain("TOKEN");
+
+    await runFnWithStack(
+      fn,
+      {
+        ...state,
+        [step.id]: { id: step.id, input: step.opts?.input as unknown[] },
+      },
+      { runStep: step.id },
+    );
+    expect(bodies.join()).toContain(token);
+  });
+});
+
+describe("inngest.sandboxes", () => {
+  test.each([
+    undefined,
+    "inngest/base:latest",
+    "my-image:v1",
+    `sha256:${"a".repeat(64)}`,
+  ])(
+    "sends image selection and exposes its pinned digest: %s",
+    async (image) => {
+      const imageDigest = image ? `sha256:${"b".repeat(64)}` : undefined;
+      const fetch = vi.fn<typeof globalThis.fetch>(async () =>
+        Response.json(
+          {
+            data: {
+              ...sandboxRef,
+              imageRef: image ?? "default",
+              ...(imageDigest && { imageDigest }),
+            },
+            metadata: { fetchedAt: now },
+          },
+          { status: 201 },
+        ),
+      );
+      const inngest = new Inngest({ id: "select-image", isDev: true, fetch });
+      const created = await inngest.sandboxes.create({
+        ...createOptions,
+        ...(image !== undefined && { image }),
+      });
+      expect(created.imageRef).toBe(image ?? "default");
+      expect(created.imageDigest).toBe(imageDigest);
+      const body = JSON.parse(fetch.mock.calls[0]?.[1]?.body as string);
+      expect(body).toEqual({
+        ...createOptions,
+        ...(image !== undefined && { image }),
+      });
+    },
+  );
+
+  const listResponse = () =>
+    Response.json({
+      data: [],
+      metadata: { fetchedAt: now },
+      page: { hasMore: false, limit: 50 },
+    });
+
+  test.each([undefined, "http://localhost:9393"])(
+    "calls dev sandbox and snapshot routes without a key (%s)",
+    async (devUrl) => {
+      const calls: Array<{ url: URL; init?: RequestInit }> = [];
+      const inngest = new Inngest({
+        id: "sandbox-dev",
+        isDev: true,
+        fetch: async (input, init) => {
+          calls.push({
+            url: new URL(input instanceof Request ? input.url : input),
+            init,
+          });
+          return listResponse();
+        },
+      });
+      inngest.setEnvVars(devUrl ? { [envKeys.InngestDevMode]: devUrl } : {});
+
+      await inngest.sandboxes.list();
+      await inngest.sandboxes.snapshots.list();
+
+      expect(calls.map(({ url }) => url.pathname)).toEqual([
+        "/v2/sandboxes",
+        "/v2/snapshots",
+      ]);
+      for (const call of calls) {
+        expect(call.url.origin).toBe(devUrl ?? "http://localhost:8288");
+        expect(new Headers(call.init?.headers).has("Authorization")).toBe(
+          false,
+        );
+      }
+    },
+  );
+
+  test("treats a list response without data as empty", async () => {
+    const inngest = new Inngest({
+      id: "sandbox-empty-list",
+      isDev: true,
+      fetch: async () => {
+        return Response.json({
+          metadata: { fetchedAt: now },
+          page: { limit: 50 },
+        });
+      },
+    });
+
+    const sandboxes = await inngest.sandboxes.list();
+    const snapshots = await inngest.sandboxes.snapshots.list();
+
+    for (const result of [sandboxes, snapshots]) {
+      expect(result).toEqual({
+        items: [],
+        page: { hasMore: false, limit: 50 },
+        fetchedAt: now,
+      });
+    }
+  });
+
+  test("parses proto3 JSON snapshot resources", async () => {
+    // Real Cloud payloads: zero counts are omitted and uint64 is a string.
+    const creating = {
+      createdAt: "2026-09-30T18:42:19.777539Z",
+      expiresAt: "2026-10-01T18:42:19.777539Z",
+      id: "a0733080-d411-494d-8ec0-c16cb7d3aee1",
+      memoryPackCount: 1,
+      resources: { memoryMb: 2048, vcpu: 2 },
+      sourceImageId: "default",
+      status: "CREATING",
+      storedBytes: "20182051",
+      updatedAt: "2026-09-30T18:42:23.826884Z",
+    };
+    const ready = {
+      compatibilityId:
+        "b81c07cfb7963033e7adc553bf8283ea52a4186292a783877c047d069fa47ebe",
+      createdAt: "2026-09-30T18:42:19.777539Z",
+      diskPackCount: 1,
+      expiresAt: "2026-10-01T18:42:19.777539Z",
+      id: "a0733080-d411-494d-8ec0-c16cb7d3aee1",
+      memoryPackCount: 1,
+      resources: { memoryMb: 2048, vcpu: 2 },
+      sourceImageId:
+        "e2c2fb128cf2ebb0a0055711ba132f78448a782cf71b05ef72ca31123d0c6972",
+      status: "READY",
+      storedBytes: "20227570",
+      updatedAt: "2026-09-30T18:42:31.651228Z",
+    };
+    const unset = {
+      ...creating,
+      memoryPackCount: undefined,
+      storedBytes: undefined,
+    };
+    const inngest = new Inngest({
+      id: "sandbox-proto3-json",
+      isDev: true,
+      fetch: async () => {
+        return Response.json({
+          data: [creating, ready, unset],
+          metadata: { fetchedAt: now },
+          page: { limit: 50 },
+        });
+      },
+    });
+
+    const { items } = await inngest.sandboxes.snapshots.list();
+
+    expect(
+      items.map(({ memoryPackCount, diskPackCount, storedBytes }) => {
+        return { memoryPackCount, diskPackCount, storedBytes };
+      }),
+    ).toEqual([
+      { memoryPackCount: 1, diskPackCount: 0, storedBytes: 20182051 },
+      { memoryPackCount: 1, diskPackCount: 1, storedBytes: 20227570 },
+      { memoryPackCount: 0, diskPackCount: 0, storedBytes: 0 },
+    ]);
+  });
+
+  test("defaults omitted zero upload bytes and empty output data", async () => {
+    const {
+      kind: _sandboxKind,
+      version: _sandboxVersion,
+      ...sandboxData
+    } = sandboxRef;
+    const {
+      kind: _processKind,
+      version: _processVersion,
+      sandboxId: _processSandboxId,
+      ...processData
+    } = processRef;
+    const sandboxPath = `/v2/sandboxes/${sandboxId}`;
+    const processPath = `${sandboxPath}/processes/${processId}`;
+    const inngest = new Inngest({
+      id: "sandbox-proto3-zero-values",
+      isDev: true,
+      fetch: async (input, init) => {
+        const url = new URL(input instanceof Request ? input.url : input);
+        const method = init?.method ?? "GET";
+        if (url.pathname === sandboxPath && method === "GET") {
+          return Response.json({ data: sandboxData });
+        }
+        if (url.pathname === `${sandboxPath}/files` && method === "PUT") {
+          return Response.json({ data: { path: "/tmp/empty" } });
+        }
+        if (url.pathname === processPath && method === "GET") {
+          return Response.json({ data: processData });
+        }
+        if (url.pathname === `${processPath}/output` && method === "GET") {
+          return Response.json({
+            data: { chunks: [{ stream: "STDOUT", encoding: "base64" }] },
+          });
+        }
+        throw new Error(`Unexpected request: ${method} ${url}`);
+      },
+    });
+
+    const sandbox = await inngest.sandboxes.get(sandboxId);
+    if (!sandbox) {
+      throw new Error("Expected sandbox");
+    }
+    const upload = await sandbox.files.upload({
+      path: "/tmp/empty",
+      data: new Uint8Array(),
+    });
+    const process = await sandbox.processes.get(processId);
+    if (!process) {
+      throw new Error("Expected process");
+    }
+    const output = await process.getOutput();
+
+    expect(upload).toEqual({ path: "/tmp/empty", bytesWritten: 0 });
+    expect(output.chunks).toEqual([
+      { stream: "STDOUT", data: new Uint8Array() },
+    ]);
+  });
+
+  test.each([
+    ["an unsafe integer string", "9007199254740993"],
+    ["a non-decimal string", "0x10"],
+    ["a negative string", "-1"],
+  ])("rejects storedBytes as %s", async (_name, storedBytes) => {
+    const inngest = new Inngest({
+      id: "sandbox-stored-bytes",
+      isDev: true,
+      fetch: async () => {
+        return Response.json({
+          data: [
+            {
+              createdAt: now,
+              expiresAt: now,
+              id: "a0733080-d411-494d-8ec0-c16cb7d3aee1",
+              resources: { memoryMb: 2048, vcpu: 2 },
+              sourceImageId: "default",
+              status: "CREATING",
+              storedBytes,
+              updatedAt: now,
+            },
+          ],
+          metadata: { fetchedAt: now },
+          page: { limit: 50 },
+        });
+      },
+    });
+
+    await expect(inngest.sandboxes.snapshots.list()).rejects.toThrow(
+      "Invalid sandbox snapshot resource at storedBytes",
+    );
+  });
+
+  test("resolves dev mode lazily after construction", async () => {
+    const fetchMock: typeof fetch = vi.fn(async () => listResponse());
+    const inngest = new Inngest({ id: "lazy-sandbox-dev", fetch: fetchMock });
+    inngest.setEnvVars({ [envKeys.InngestDevMode]: "0" });
+    await expect(inngest.sandboxes.list()).rejects.toThrow(
+      "A signing or API key is required",
+    );
+    expect(fetchMock).not.toHaveBeenCalled();
+
+    inngest.setEnvVars({ [envKeys.InngestDevMode]: "http://localhost:9393" });
+    await inngest.sandboxes.list();
+    expect(fetchMock).toHaveBeenCalledWith(
+      new URL("http://localhost:9393/v2/sandboxes?limit=50"),
+      expect.anything(),
+    );
+
+    inngest.setEnvVars({ [envKeys.InngestDevMode]: "0" });
+    await expect(inngest.sandboxes.list()).rejects.toThrow(
+      "A signing or API key is required",
+    );
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  test.each([false, true])(
+    "preserves signing key auth (isDev=%s)",
+    async (isDev) => {
+      let authorization: string | null = null;
+      const inngest = new Inngest({
+        id: "sandbox-signing-key",
+        isDev,
+        signingKey: "signkey-cloud",
+        fetch: async (_input, init) => {
+          authorization = new Headers(init?.headers).get("Authorization");
+          return listResponse();
+        },
+      });
+      inngest.setEnvVars({});
+      await inngest.sandboxes.list();
+      expect(authorization).toBe(`Bearer ${hashSigningKey("signkey-cloud")}`);
+    },
+  );
+
+  test.each(["cloud", "standalone"])(
+    "requires a key for %s clients",
+    async (target) => {
+      const fetchMock: typeof fetch = vi.fn();
+      const inngest = new Inngest({
+        id: "sandbox-cloud",
+        isDev: false,
+        fetch: fetchMock,
+      });
+      inngest.setEnvVars({});
+      const client =
+        target === "cloud"
+          ? inngest.sandboxes
+          : createSandboxClient({
+              baseUrl: () => "https://api.inngest.com",
+              apiKey: () => undefined,
+              headers: () => ({}),
+              fetch: () => fetchMock,
+            });
+      await expect(client.list()).rejects.toThrow(
+        "A signing or API key is required",
+      );
+      expect(fetchMock).not.toHaveBeenCalled();
+    },
+  );
+
+  test("surfaces the dev server's CLI login instruction", async () => {
+    const inngest = new Inngest({
+      id: "sandbox-login-required",
+      isDev: true,
+      fetch: async () =>
+        Response.json(
+          {
+            errors: [
+              {
+                code: "cloud_login_required",
+                message:
+                  "Run \`inngest login\` to use Cloud sandboxes from the dev server",
+              },
+            ],
+          },
+          { status: 401 },
+        ),
+    });
+    inngest.setEnvVars({});
+    await expect(inngest.sandboxes.list()).rejects.toThrow("inngest login");
+  });
+
+  test("accepts uppercase ULIDs and human-readable sandbox names", async () => {
+    const { kind: _kind, version: _version, ...resource } = sandboxRef;
+    const sentNames: string[] = [];
+    const fetchMock: typeof fetch = vi.fn(async (_input, init) => {
+      const body = JSON.parse(String(init?.body)) as { name: string };
+      sentNames.push(body.name);
+      return Response.json(
+        { data: { ...resource, name: body.name } },
+        { status: 201 },
+      );
+    });
+    const client = createSandboxClient({
+      baseUrl: () => "https://api.example.test",
+      apiKey: () => "signkey-test",
+      headers: () => ({}),
+      fetch: () => fetchMock,
+    });
+    const names = [
+      "01J4Z3R7M8N9P0Q1S2T3V4W5XY",
+      "Repo Build / 01J4Z3R7M8N9P0Q1S2T3V4W5XY",
+      "my.sandbox",
+      "déploiement-🚀",
+      "🚀".repeat(255),
+    ];
+
+    for (const name of names) {
+      await expect(
+        client.create({ ...createOptions, name }),
+      ).resolves.toMatchObject({ name });
+      expect(() =>
+        parseSandboxOperation({
+          protocolVersion: 1,
+          action: "create",
+          input: [{ ...createOptions, name }],
+        }),
+      ).not.toThrow();
+    }
+
+    expect(sentNames).toEqual(names);
+  });
+
+  test.each([
+    ["empty", "", "must not be empty"],
+    ["too long", "a".repeat(256), "must not exceed 255 characters"],
+    [
+      "too many Unicode characters",
+      "🚀".repeat(256),
+      "must not exceed 255 characters",
+    ],
+    [
+      "leading whitespace",
+      " sandbox",
+      "must not contain leading or trailing whitespace",
+    ],
+    [
+      "trailing whitespace",
+      "sandbox ",
+      "must not contain leading or trailing whitespace",
+    ],
+    [
+      "control character",
+      "sandbox\nname",
+      "must not contain control characters",
+    ],
+  ] as const)(
+    "rejects a sandbox name that is %s",
+    async (_case, name, message) => {
+      const fetchMock: typeof fetch = vi.fn();
+      const client = createSandboxClient({
+        baseUrl: () => "https://api.example.test",
+        apiKey: () => "signkey-test",
+        headers: () => ({}),
+        fetch: () => fetchMock,
+      });
+
+      await expect(client.create({ ...createOptions, name })).rejects.toThrow(
+        message,
+      );
+      expect(() =>
+        parseSandboxOperation({
+          protocolVersion: 1,
+          action: "create",
+          input: [{ ...createOptions, name }],
+        }),
+      ).toThrow(message);
+      expect(fetchMock).not.toHaveBeenCalled();
+    },
+  );
+
+  test("supports the direct snapshot lifecycle and cloning", async () => {
+    const { kind: _kind, version: _version, ...sandboxResource } = sandboxRef;
+    const {
+      kind: _snapshotKind,
+      version: _snapshotVersion,
+      ...snapshotResource
+    } = snapshotRef;
+    const requests: Array<{ method: string; url: URL; init?: RequestInit }> =
+      [];
+    const fetchMock: typeof fetch = vi.fn(async (input, init) => {
+      const url = new URL(input instanceof Request ? input.url : input);
+      const method = init?.method ?? "GET";
+      requests.push({ method, url, init });
+      if (method === "GET" && url.pathname === `/v2/sandboxes/${sandboxId}`) {
+        return Response.json({ data: sandboxResource });
+      }
+      if (
+        method === "POST" &&
+        url.pathname === `/v2/sandboxes/${sandboxId}/snapshots`
+      ) {
+        return Response.json({ data: snapshotResource }, { status: 201 });
+      }
+      if (method === "GET" && url.pathname === "/v2/snapshots") {
+        return Response.json({
+          data: [snapshotResource],
+          metadata: { fetchedAt: now },
+          page: { cursor: "next", hasMore: true, limit: 2 },
+        });
+      }
+      if (method === "GET" && url.pathname === `/v2/snapshots/${snapshotId}`) {
+        return Response.json({ data: snapshotResource });
+      }
+      if (
+        method === "DELETE" &&
+        url.pathname === `/v2/snapshots/${snapshotId}`
+      ) {
+        return new Response(null, { status: 204 });
+      }
+      if (method === "POST" && url.pathname === "/v2/sandboxes") {
+        const body = JSON.parse(String(init?.body)) as {
+          name: string;
+          snapshotId: string;
+        };
+        return Response.json(
+          { data: { ...sandboxResource, name: body.name } },
+          { status: 201 },
+        );
+      }
+      throw new Error(`Unexpected request: ${method} ${url}`);
+    });
+    const client = createSandboxClient({
+      baseUrl: () => "https://api.example.test",
+      apiKey: () => "signkey-test",
+      headers: () => ({}),
+      fetch: () => fetchMock,
+    });
+
+    const sandbox = await client.get(sandboxId);
+    if (!sandbox) {
+      throw new Error("Expected sandbox");
+    }
+    const created = await sandbox.snapshot({}, { timeout: "1s" });
+    const listed = await client.snapshots.list({ cursor: "opaque", limit: 2 });
+    const fetched = await client.snapshots.get(snapshotId);
+    await created.delete();
+    const clone = await created.clone({ name: "snapshot-clone" });
+
+    expect(created).toMatchObject(snapshotRef);
+    expect(listed).toMatchObject({
+      items: [expect.objectContaining(snapshotRef)],
+      page: { cursor: "next", hasMore: true, limit: 2 },
+      fetchedAt: now,
+    });
+    expect(fetched).toMatchObject(snapshotRef);
+    expect(clone.name).toBe("snapshot-clone");
+    expect(Object.isFrozen(client.snapshots)).toBe(true);
+    expect(Object.isFrozen(created)).toBe(true);
+    expect(Object.isFrozen(created.resources)).toBe(true);
+    expect("refresh" in created).toBe(false);
+    expect(requests[1]).toMatchObject({ method: "POST" });
+    expect(requests[1]?.init?.body).toBeUndefined();
+    expect(requests[2]?.url.searchParams.get("cursor")).toBe("opaque");
+    expect(requests[2]?.url.searchParams.get("limit")).toBe("2");
+    expect(requests[3]).toMatchObject({
+      method: "GET",
+      url: expect.objectContaining({
+        pathname: `/v2/snapshots/${snapshotId}`,
+      }),
+    });
+    expect(JSON.parse(String(requests[5]?.init?.body))).toEqual({
+      name: "snapshot-clone",
+      snapshotId,
+    });
+  });
+
+  test("polls snapshot readiness immediately and tolerates transient failures", async () => {
+    vi.useFakeTimers();
+    try {
+      const { kind: _kind, version: _version, ...sandboxResource } = sandboxRef;
+      const {
+        kind: _snapshotKind,
+        version: _snapshotVersion,
+        compatibilityId: _compatibilityId,
+        ...snapshotResource
+      } = snapshotRef;
+      const creatingResource = { ...snapshotResource, status: "CREATING" };
+      const readyResource = {
+        ...snapshotResource,
+        compatibilityId: snapshotRef.compatibilityId,
+      };
+      let snapshotGets = 0;
+      const fetchMock: typeof fetch = vi.fn(async (input, init) => {
+        const url = new URL(input instanceof Request ? input.url : input);
+        const method = init?.method ?? "GET";
+        if (method === "GET" && url.pathname === `/v2/sandboxes/${sandboxId}`) {
+          return Response.json({ data: sandboxResource });
+        }
+        if (method === "POST") {
+          return Response.json({ data: creatingResource }, { status: 202 });
+        }
+        snapshotGets++;
+        if (snapshotGets === 1) {
+          return Response.json({ data: creatingResource });
+        }
+        if (snapshotGets === 2) {
+          throw new TypeError("connection reset");
+        }
+        return Response.json({ data: readyResource });
+      });
+      const client = createSandboxClient({
+        baseUrl: () => "https://api.example.test",
+        apiKey: () => "signkey-test",
+        headers: () => ({}),
+        fetch: () => fetchMock,
+      });
+      const sandbox = await client.get(sandboxId);
+      if (!sandbox) {
+        throw new Error("Expected sandbox");
+      }
+      const result = sandbox.snapshot({}, { timeout: "10s" });
+      const assertion = expect(result).resolves.toMatchObject({
+        id: snapshotId,
+        status: "READY",
+      });
+      // The first poll happens before any delay.
+      await vi.advanceTimersByTimeAsync(0);
+      expect(snapshotGets).toBe(1);
+      // A transient failure on the second poll keeps the loop alive.
+      await vi.advanceTimersByTimeAsync(1_000);
+      expect(snapshotGets).toBe(2);
+      await vi.advanceTimersByTimeAsync(1_000);
+      expect(snapshotGets).toBe(3);
+
+      await assertion;
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  test("fails snapshot readiness on a terminal status or timeout", async () => {
+    vi.useFakeTimers();
+    try {
+      const { kind: _kind, version: _version, ...sandboxResource } = sandboxRef;
+      const {
+        kind: _snapshotKind,
+        version: _snapshotVersion,
+        compatibilityId: _compatibilityId,
+        ...snapshotResource
+      } = snapshotRef;
+      let status: "CREATING" | "FAILED" = "CREATING";
+      const fetchMock: typeof fetch = vi.fn(async (input, init) => {
+        const url = new URL(input instanceof Request ? input.url : input);
+        if (url.pathname === `/v2/sandboxes/${sandboxId}`) {
+          return Response.json({ data: sandboxResource });
+        }
+        return Response.json(
+          {
+            data: {
+              ...snapshotResource,
+              status: init?.method === "POST" ? "CREATING" : status,
+            },
+          },
+          { status: init?.method === "POST" ? 202 : 200 },
+        );
+      });
+      const client = createSandboxClient({
+        baseUrl: () => "https://api.example.test",
+        apiKey: () => "signkey-test",
+        headers: () => ({}),
+        fetch: () => fetchMock,
+      });
+      const sandbox = await client.get(sandboxId);
+      if (!sandbox) {
+        throw new Error("Expected sandbox");
+      }
+      const timedOut = expect(
+        sandbox.snapshot({}, { timeout: "2s" }),
+      ).rejects.toMatchObject({
+        name: "SandboxError",
+        action: "snapshot.waitUntilReady",
+        code: "sandbox_snapshot_wait_timed_out",
+        snapshotId,
+        retryable: false,
+        details: [{ status: "CREATING", timeoutMs: 2_000 }],
+      });
+      await vi.advanceTimersByTimeAsync(2_000);
+      await timedOut;
+
+      status = "FAILED";
+      const failed = expect(
+        sandbox.snapshot({}, { timeout: "2s" }),
+      ).rejects.toMatchObject({
+        name: "SandboxError",
+        action: "snapshot.waitUntilReady",
+        code: "sandbox_snapshot_not_ready",
+        snapshotId,
+        retryable: false,
+        details: [{ status: "FAILED" }],
+      });
+      await vi.advanceTimersByTimeAsync(0);
+      await failed;
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  test("reports an uncertain direct snapshot Create as ambiguous", async () => {
+    const { kind: _kind, version: _version, ...sandboxResource } = sandboxRef;
+    let requestCount = 0;
+    const client = createSandboxClient({
+      baseUrl: () => "https://api.example.test",
+      apiKey: () => "signkey-test",
+      headers: () => ({}),
+      fetch: () => async () => {
+        requestCount++;
+        if (requestCount === 1) {
+          return Response.json({ data: sandboxResource });
+        }
+        throw new TypeError("connection reset");
+      },
+    });
+    const sandbox = await client.get(sandboxId);
+    if (!sandbox) {
+      throw new Error("Expected sandbox");
+    }
+
+    await expect(sandbox.snapshot()).rejects.toMatchObject({
+      name: "SandboxError",
+      action: "snapshot.create",
+      code: "operation_ambiguous",
+      message: expect.stringContaining("Check snapshots.list()"),
+      snapshotId: undefined,
+      sandboxId,
+      ambiguous: true,
+      retryable: false,
+    });
+  });
+
+  test("names direct snapshots and lists them by name", async () => {
+    const { kind: _kind, version: _version, ...sandboxResource } = sandboxRef;
+    const {
+      kind: _snapshotKind,
+      version: _snapshotVersion,
+      ...snapshotResource
+    } = snapshotRef;
+    const requests: Array<{ method: string; url: URL; init?: RequestInit }> =
+      [];
+    const fetchMock: typeof fetch = vi.fn(async (input, init) => {
+      const url = new URL(input instanceof Request ? input.url : input);
+      const method = init?.method ?? "GET";
+      requests.push({ method, url, init });
+      if (method === "GET" && url.pathname === `/v2/sandboxes/${sandboxId}`) {
+        return Response.json({ data: sandboxResource });
+      }
+      if (method === "POST") {
+        return Response.json(
+          { data: { ...snapshotResource, name: "base" } },
+          { status: 201 },
+        );
+      }
+      return Response.json({
+        data: [
+          { ...snapshotResource, name: "base" },
+          { ...snapshotResource, name: "" },
+          { ...snapshotResource, name: null },
+        ],
+        metadata: { fetchedAt: now },
+        page: { hasMore: false, limit: 50 },
+      });
+    });
+    const client = createSandboxClient({
+      baseUrl: () => "https://api.example.test",
+      apiKey: () => "signkey-test",
+      headers: () => ({}),
+      fetch: () => fetchMock,
+    });
+    const sandbox = await client.get(sandboxId);
+    if (!sandbox) {
+      throw new Error("Expected sandbox");
+    }
+
+    const created = await sandbox.snapshot({ name: "base" });
+    const listed = await client.snapshots.list({ name: "base" });
+
+    expect(created.name).toBe("base");
+    expect(requests[1]).toMatchObject({ method: "POST" });
+    expect(JSON.parse(String(requests[1]?.init?.body))).toEqual({
+      name: "base",
+    });
+    expect(requests[1]?.init?.headers).toMatchObject({
+      "Content-Type": "application/json",
+    });
+    expect(requests[2]?.url.searchParams.get("name")).toBe("base");
+    expect(requests[2]?.url.searchParams.get("limit")).toBe("50");
+    expect(listed.items.map((snapshot) => snapshot.name)).toEqual([
+      "base",
+      undefined,
+      undefined,
+    ]);
+    expect("name" in listed.items[1]!).toBe(false);
+  });
+
+  test.each([
+    ["", "must not be empty"],
+    [" base", "must not contain leading or trailing whitespace"],
+    ["base\n", "must not contain"],
+    ["x".repeat(256), "must not exceed 255 characters"],
+  ])(
+    "rejects invalid snapshot name %j before dispatch",
+    async (name, message) => {
+      const { kind: _kind, version: _version, ...sandboxResource } = sandboxRef;
+      let requestCount = 0;
+      const client = createSandboxClient({
+        baseUrl: () => "https://api.example.test",
+        apiKey: () => "signkey-test",
+        headers: () => ({}),
+        fetch: () => async () => {
+          requestCount++;
+          return Response.json({ data: sandboxResource });
+        },
+      });
+      const sandbox = await client.get(sandboxId);
+      if (!sandbox) {
+        throw new Error("Expected sandbox");
+      }
+
+      await expect(sandbox.snapshot({ name })).rejects.toThrow(message);
+      await expect(client.snapshots.list({ name })).rejects.toThrow(message);
+      expect(() =>
+        parseSandboxOperation({
+          protocolVersion: 1,
+          action: "snapshot.create",
+          target: { sandbox: sandboxRef },
+          input: [{ name }],
+        }),
+      ).toThrow(message);
+      expect(() =>
+        parseSandboxOperation({
+          protocolVersion: 1,
+          action: "snapshot.list",
+          input: [{ limit: 50, name }],
+        }),
+      ).toThrow(message);
+      expect(requestCount).toBe(1);
+    },
+  );
+
+  test("reports a taken direct snapshot name with its error code", async () => {
+    const { kind: _kind, version: _version, ...sandboxResource } = sandboxRef;
+    let requestCount = 0;
+    const client = createSandboxClient({
+      baseUrl: () => "https://api.example.test",
+      apiKey: () => "signkey-test",
+      headers: () => ({}),
+      fetch: () => async () => {
+        requestCount++;
+        if (requestCount === 1) {
+          return Response.json({ data: sandboxResource });
+        }
+        return Response.json(
+          {
+            errors: [
+              {
+                code: "sandbox_snapshot_name_taken",
+                message: "snapshot name is taken",
+              },
+            ],
+          },
+          { status: 409 },
+        );
+      },
+    });
+    const sandbox = await client.get(sandboxId);
+    if (!sandbox) {
+      throw new Error("Expected sandbox");
+    }
+
+    await expect(sandbox.snapshot({ name: "base" })).rejects.toMatchObject({
+      name: "SandboxError",
+      action: "snapshot.create",
+      code: "sandbox_snapshot_name_taken",
+      message: "snapshot name is taken",
+      status: 409,
+      sandboxId,
+      ambiguous: false,
+      retryable: false,
+    });
+    expect(requestCount).toBe(2);
+  });
+
+  test("decodes captured Exec output as non-fatal UTF-8", async () => {
+    const { kind: _kind, version: _version, ...resource } = sandboxRef;
+    const stdout = new Uint8Array([
+      ...new TextEncoder().encode("hello π 🚀"),
+      0xff,
+    ]);
+    const stderr = new Uint8Array([0xe2, 0x82]);
+    let requestCount = 0;
+    const fetchMock: typeof fetch = vi.fn(async () => {
+      requestCount++;
+      if (requestCount === 1) {
+        return Response.json({ data: resource });
+      }
+      return Response.json({
+        data: {
+          stdout: encodeBase64(stdout),
+          stderr: encodeBase64(stderr),
+          encoding: "base64",
+          exitCode: 0,
+        },
+      });
+    });
+    const client = createSandboxClient({
+      baseUrl: () => "https://api.example.test",
+      apiKey: () => "signkey-test",
+      headers: () => ({}),
+      fetch: () => fetchMock,
+    });
+
+    const sandbox = await client.get(sandboxId);
+    if (!sandbox) {
+      throw new Error("Expected sandbox");
+    }
+    await expect(sandbox.commands.run(["/bin/true"])).resolves.toEqual({
+      stdout: "hello π 🚀�",
+      stderr: "�",
+      exitCode: 0,
+      output: { truncated: false },
+    });
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  test("normalizes omitted empty captured Exec streams", async () => {
+    const { kind: _kind, version: _version, ...resource } = sandboxRef;
+    let requestCount = 0;
+    const fetchMock: typeof fetch = vi.fn(async () => {
+      requestCount++;
+      if (requestCount === 1) {
+        return Response.json({ data: resource });
+      }
+      return Response.json({
+        data: {
+          encoding: "base64",
+          exitCode: 0,
+        },
+      });
+    });
+    const client = createSandboxClient({
+      baseUrl: () => "https://api.example.test",
+      apiKey: () => "signkey-test",
+      headers: () => ({}),
+      fetch: () => fetchMock,
+    });
+
+    const sandbox = await client.get(sandboxId);
+    if (!sandbox) {
+      throw new Error("Expected sandbox");
+    }
+    await expect(sandbox.commands.run(["/bin/true"])).resolves.toEqual({
+      stdout: "",
+      stderr: "",
+      exitCode: 0,
+      output: { truncated: false },
+    });
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  test("validates Create environment before transport", async () => {
+    const fetchMock: typeof fetch = vi.fn();
+    const client = createSandboxClient({
+      baseUrl: () => "https://api.example.test",
+      apiKey: () => "signkey-test",
+      headers: () => ({}),
+      fetch: () => fetchMock,
+    });
+    const tooMany = Object.fromEntries(
+      Array.from({ length: 257 }, (_, index) => [`KEY_${index}`, "value"]),
+    );
+
+    for (const environment of [
+      { "": "invalid" },
+      { KEY: "value\0" },
+      tooMany,
+      { KEY: "x".repeat(64 * 1_024) },
+    ]) {
+      await expect(
+        client.create({ ...createOptions, environment }),
+      ).rejects.toBeInstanceOf(SandboxValidationError);
+    }
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  test("marks Create transport failures as retryable", async () => {
+    const client = createSandboxClient({
+      baseUrl: () => "https://api.example.test",
+      apiKey: () => "signkey-test",
+      headers: () => ({}),
+      fetch: () => async () => {
+        throw new TypeError("connection refused");
+      },
+    });
+
+    await expect(client.create(createOptions)).rejects.toMatchObject({
+      name: "SandboxError",
+      action: "create",
+      code: "compute_unavailable",
+      ambiguous: false,
+      retryable: true,
+    });
+  });
+
+  test.each([
+    ["destroy", "repeating Destroy is safe"],
+    ["file.upload", "Repeating the same upload is safe"],
+  ] as const)(
+    "marks %s transport failures as retryable with recovery guidance",
+    async (action, message) => {
+      let requestCount = 0;
+      const { kind: _kind, version: _version, ...sandboxResource } = sandboxRef;
+      const client = createSandboxClient({
+        baseUrl: () => "https://api.example.test",
+        apiKey: () => "key",
+        headers: () => ({}),
+        fetch: () => async () => {
+          requestCount++;
+          if (requestCount === 1) {
+            return Response.json({ data: sandboxResource });
+          }
+          throw new TypeError("connection refused");
+        },
+      });
+      const sandbox = await client.get(sandboxId);
+      if (!sandbox) {
+        throw new Error("Expected sandbox");
+      }
+
+      const operation =
+        action === "destroy"
+          ? sandbox.destroy()
+          : sandbox.files.upload({
+              path: "/tmp/input.bin",
+              data: new Uint8Array([1]),
+            });
+
+      await expect(operation).rejects.toMatchObject({
+        name: "SandboxError",
+        action,
+        code: "compute_unavailable",
+        message: expect.stringContaining(message),
+        ambiguous: false,
+        retryable: true,
+      });
+    },
+  );
+
+  test.each([
+    ["exec", "Inspect its external effects"],
+    ["process.start", "List processes and reconcile"],
+    ["process.signal", "Get or wait for the process"],
+  ] as const)(
+    "marks %s transport failures as ambiguous with recovery guidance",
+    async (action, message) => {
+      let requestCount = 0;
+      const { kind: _kind, version: _version, ...sandboxResource } = sandboxRef;
+      const {
+        kind: _processKind,
+        version: _processVersion,
+        sandboxId: _processSandboxId,
+        ...processResource
+      } = processRef;
+      const client = createSandboxClient({
+        baseUrl: () => "https://api.example.test",
+        apiKey: () => "key",
+        headers: () => ({}),
+        fetch: () => async () => {
+          requestCount++;
+          if (requestCount === 1) {
+            return Response.json({ data: sandboxResource });
+          }
+          if (action === "process.signal" && requestCount === 2) {
+            return Response.json({ data: processResource });
+          }
+          throw new TypeError("connection refused");
+        },
+      });
+      const sandbox = await client.get(sandboxId);
+      if (!sandbox) {
+        throw new Error("Expected sandbox");
+      }
+
+      let operation: Promise<unknown>;
+      switch (action) {
+        case "exec":
+          operation = sandbox.commands.run(["/bin/true"]);
+          break;
+        case "process.start":
+          operation = sandbox.processes.start({ command: ["/bin/true"] });
+          break;
+        case "process.signal": {
+          const process = await sandbox.processes.get(processId);
+          if (!process) {
+            throw new Error("Expected process");
+          }
+          operation = process.signal({ signal: 15 });
+          break;
+        }
+      }
+
+      await expect(operation).rejects.toMatchObject({
+        name: "SandboxError",
+        action,
+        code: "operation_ambiguous",
+        message: expect.stringContaining(message),
+        ambiguous: true,
+        retryable: false,
+      });
+    },
+  );
+
+  test.each([
+    ["create", 201, "compute_unavailable", false, true],
+    ["destroy", 202, "compute_unavailable", false, true],
+    ["exec", 200, "operation_ambiguous", true, false],
+    ["process.start", 201, "operation_ambiguous", true, false],
+    ["file.upload", 200, "compute_unavailable", false, true],
+  ] as const)(
+    "classifies a lost successful %s response body",
+    async (action, status, code, ambiguous, retryable) => {
+      let requestCount = 0;
+      const { kind: _kind, version: _version, ...sandboxResource } = sandboxRef;
+      const client = createSandboxClient({
+        baseUrl: () => "https://api.example.test",
+        apiKey: () => "key",
+        headers: () => ({}),
+        fetch: () => async () => {
+          requestCount++;
+          if (action !== "create" && requestCount === 1) {
+            return Response.json({ data: sandboxResource });
+          }
+          return new Response(
+            new ReadableStream({
+              start(controller) {
+                controller.error(new Error("response body lost"));
+              },
+            }),
+            { status, headers: { "Content-Type": "application/json" } },
+          );
+        },
+      });
+
+      let operation: Promise<unknown>;
+      if (action === "create") {
+        operation = client.create(createOptions);
+      } else {
+        const sandbox = await client.get(sandboxId);
+        if (!sandbox) {
+          throw new Error("Expected sandbox");
+        }
+        switch (action) {
+          case "destroy":
+            operation = sandbox.destroy();
+            break;
+          case "exec":
+            operation = sandbox.commands.run(["/bin/true"]);
+            break;
+          case "process.start":
+            operation = sandbox.processes.start({ command: ["/bin/true"] });
+            break;
+          case "file.upload":
+            operation = sandbox.files.upload({
+              path: "/tmp/input.bin",
+              data: new Uint8Array([1]),
+            });
+            break;
+        }
+      }
+
+      await expect(operation).rejects.toMatchObject({
+        name: "SandboxError",
+        action,
+        code,
+        ambiguous,
+        retryable,
+      });
+    },
+  );
+
+  test("replaces a generic ambiguous API message with action-specific guidance", async () => {
+    let requestCount = 0;
+    const { kind: _kind, version: _version, ...sandboxResource } = sandboxRef;
+    const client = createSandboxClient({
+      baseUrl: () => "https://api.example.test",
+      apiKey: () => "key",
+      headers: () => ({}),
+      fetch: () => async () => {
+        requestCount++;
+        if (requestCount === 1) {
+          return Response.json({ data: sandboxResource });
+        }
+        return Response.json(
+          {
+            errors: [
+              {
+                code: "operation_ambiguous",
+                message: "Operation result is ambiguous",
+              },
+            ],
+          },
+          { status: 409 },
+        );
+      },
+    });
+    const sandbox = await client.get(sandboxId);
+    if (!sandbox) {
+      throw new Error("Expected sandbox");
+    }
+
+    await expect(
+      sandbox.processes.start({ command: ["/bin/true"] }),
+    ).rejects.toMatchObject({
+      action: "process.start",
+      code: "operation_ambiguous",
+      message: expect.stringContaining("List processes and reconcile"),
+    });
+  });
+
+  test("guides an ambiguous Create response toward reconciliation", async () => {
+    const client = createSandboxClient({
+      baseUrl: () => "https://api.example.test",
+      apiKey: () => "key",
+      headers: () => ({}),
+      fetch: () => async () =>
+        Response.json(
+          {
+            errors: [
+              {
+                code: "operation_ambiguous",
+                message: "Operation result is ambiguous",
+              },
+            ],
+          },
+          { status: 409 },
+        ),
+    });
+
+    await expect(client.create(createOptions)).rejects.toMatchObject({
+      action: "create",
+      code: "operation_ambiguous",
+      message: expect.stringContaining("List sandboxes and reconcile by name"),
+      ambiguous: true,
+      retryable: false,
+    });
+  });
+
+  test.each([
+    "PENDING",
+    "STARTING",
+    "RUNNING",
+    "PAUSED",
+    "TERMINATING",
+    "TERMINATED",
+    "FAILED",
+  ] as const)(
+    "accepts an existing %s sandbox from Create when waiting is disabled",
+    async (status) => {
+      const { kind: _kind, version: _version, ...resource } = sandboxRef;
+      const requests: RequestInit[] = [];
+      const fetchMock: typeof fetch = vi.fn(async (_input, init) => {
+        requests.push(init ?? {});
+        return Response.json(
+          {
+            data: {
+              ...resource,
+              status,
+              ...(status !== "RUNNING" && { startedAt: undefined }),
+            },
+          },
+          { status: 200 },
+        );
+      });
+      const client = createSandboxClient({
+        baseUrl: () => "https://api.example.test",
+        apiKey: () => "signkey-test",
+        headers: () => ({ "X-Inngest-Env": "branch" }),
+        fetch: () => fetchMock,
+      });
+
+      const sandbox = await client.create({
+        ...createOptions,
+        runningTimeout: false,
+      });
+
+      expect(sandbox.id).toBe(sandboxId);
+      expect(sandbox.status).toBe(status);
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      expect(JSON.parse(String(requests[0]?.body))).toEqual(createOptions);
+    },
+  );
+
+  test("waits for a STARTING sandbox to reach RUNNING by default", async () => {
+    const { kind: _kind, version: _version, ...runningResource } = sandboxRef;
+    const startingResource = {
+      ...runningResource,
+      status: "STARTING",
+      startedAt: undefined,
+    };
+    const calls: Array<{ url: URL; init?: RequestInit }> = [];
+    const fetchMock: typeof fetch = vi.fn(async (input, init) => {
+      const url = new URL(input instanceof Request ? input.url : input);
+      calls.push({ url, init });
+      if (init?.method === "POST") {
+        return Response.json({ data: startingResource }, { status: 202 });
+      }
+      return Response.json({ data: runningResource });
+    });
+    const client = createSandboxClient({
+      baseUrl: () => "https://api.example.test",
+      apiKey: () => "signkey-test",
+      headers: () => ({}),
+      fetch: () => fetchMock,
+    });
+
+    const running = await client.create(createOptions);
+    expect(running.status).toBe("RUNNING");
+    expect(calls).toHaveLength(2);
+    expect(calls.map(({ init }) => init?.method)).toEqual(["POST", "GET"]);
+    expect(JSON.parse(String(calls[0]?.init?.body))).toEqual(createOptions);
+  });
+
+  test("does not poll when Create immediately returns RUNNING", async () => {
+    const { kind: _kind, version: _version, ...runningResource } = sandboxRef;
+    const fetchMock: typeof fetch = vi.fn(async () =>
+      Response.json({ data: runningResource }, { status: 201 }),
+    );
+    const client = createSandboxClient({
+      baseUrl: () => "https://api.example.test",
+      apiKey: () => "signkey-test",
+      headers: () => ({}),
+      fetch: () => fetchMock,
+    });
+
+    await expect(client.create(createOptions)).resolves.toMatchObject({
+      id: sandboxId,
+      status: "RUNNING",
+    });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  test("returns STARTING immediately when runningTimeout is false", async () => {
+    const { kind: _kind, version: _version, ...runningResource } = sandboxRef;
+    const startingResource = {
+      ...runningResource,
+      status: "STARTING",
+      startedAt: undefined,
+    };
+    const requests: RequestInit[] = [];
+    const fetchMock: typeof fetch = vi.fn(async (_input, init) => {
+      requests.push(init ?? {});
+      return Response.json({ data: startingResource }, { status: 202 });
+    });
+    const client = createSandboxClient({
+      baseUrl: () => "https://api.example.test",
+      apiKey: () => "signkey-test",
+      headers: () => ({}),
+      fetch: () => fetchMock,
+    });
+
+    await expect(
+      client.create({ ...createOptions, runningTimeout: false }),
+    ).resolves.toMatchObject({ id: sandboxId, status: "STARTING" });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(JSON.parse(String(requests[0]?.body))).toEqual(createOptions);
+  });
+
+  test("waitUntilRunning reloads a STARTING sandbox", async () => {
+    const { kind: _kind, version: _version, ...runningResource } = sandboxRef;
+    const startingResource = {
+      ...runningResource,
+      status: "STARTING",
+      startedAt: undefined,
+    };
+    let requestCount = 0;
+    const client = createSandboxClient({
+      baseUrl: () => "https://api.example.test",
+      apiKey: () => "signkey-test",
+      headers: () => ({}),
+      fetch: () => async () => {
+        requestCount++;
+        return requestCount === 1
+          ? Response.json({ data: startingResource }, { status: 202 })
+          : Response.json({ data: runningResource });
+      },
+    });
+
+    const starting = await client.create({
+      ...createOptions,
+      runningTimeout: false,
+    });
+    const running = await starting.waitUntilRunning({ timeout: "5s" });
+
+    expect(starting.status).toBe("STARTING");
+    expect(running.status).toBe("RUNNING");
+    expect(requestCount).toBe(2);
+  });
+
+  test("reports terminal startup failure without retrying", async () => {
+    const { kind: _kind, version: _version, ...runningResource } = sandboxRef;
+    const startingResource = {
+      ...runningResource,
+      status: "STARTING",
+      startedAt: undefined,
+    };
+    let requestCount = 0;
+    const client = createSandboxClient({
+      baseUrl: () => "https://api.example.test",
+      apiKey: () => "signkey-test",
+      headers: () => ({}),
+      fetch: () => async () => {
+        requestCount++;
+        return requestCount === 1
+          ? Response.json({ data: startingResource }, { status: 202 })
+          : Response.json({
+              data: {
+                ...startingResource,
+                status: "FAILED",
+                endedAt: now,
+                error: "guest failed to start",
+              },
+            });
+      },
+    });
+
+    await expect(client.create(createOptions)).rejects.toMatchObject({
+      name: "SandboxError",
+      action: "create",
+      code: "sandbox_start_failed",
+      sandboxId,
+      retryable: false,
+      details: [
+        {
+          status: "FAILED",
+          error: "guest failed to start",
+        },
+      ],
+    });
+    expect(requestCount).toBe(2);
+  });
+
+  test("defaults the readiness timeout to 120 seconds", async () => {
+    vi.useFakeTimers();
+    try {
+      const { kind: _kind, version: _version, ...runningResource } = sandboxRef;
+      const startingResource = {
+        ...runningResource,
+        status: "STARTING",
+        startedAt: undefined,
+      };
+      const methods: string[] = [];
+      const fetchMock: typeof fetch = vi.fn(async (_input, init) => {
+        methods.push(init?.method ?? "GET");
+        return Response.json(
+          { data: startingResource },
+          { status: init?.method === "POST" ? 202 : 200 },
+        );
+      });
+      const client = createSandboxClient({
+        baseUrl: () => "https://api.example.test",
+        apiKey: () => "signkey-test",
+        headers: () => ({}),
+        fetch: () => fetchMock,
+      });
+
+      const result = client.create(createOptions);
+      const assertion = expect(result).rejects.toMatchObject({
+        name: "SandboxError",
+        action: "create",
+        code: "sandbox_start_timed_out",
+        sandboxId,
+        retryable: false,
+        details: [{ status: "STARTING", timeoutMs: 120_000 }],
+      });
+      await vi.advanceTimersByTimeAsync(120_000);
+
+      await assertion;
+      expect(methods.filter((method) => method === "POST")).toHaveLength(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  test("honors an explicit readiness timeout without retrying Create", async () => {
+    vi.useFakeTimers();
+    try {
+      const { kind: _kind, version: _version, ...runningResource } = sandboxRef;
+      const startingResource = {
+        ...runningResource,
+        status: "STARTING",
+        startedAt: undefined,
+      };
+      const fetchMock: typeof fetch = vi.fn(async (_input, init) =>
+        Response.json(
+          { data: startingResource },
+          { status: init?.method === "POST" ? 202 : 200 },
+        ),
+      );
+      const client = createSandboxClient({
+        baseUrl: () => "https://api.example.test",
+        apiKey: () => "signkey-test",
+        headers: () => ({}),
+        fetch: () => fetchMock,
+      });
+
+      const result = client.create({
+        ...createOptions,
+        runningTimeout: "1s",
+      });
+      const assertion = expect(result).rejects.toMatchObject({
+        name: "SandboxError",
+        action: "create",
+        code: "sandbox_start_timed_out",
+        sandboxId,
+        retryable: false,
+        details: [{ status: "STARTING", timeoutMs: 1_000 }],
+      });
+      await vi.advanceTimersByTimeAsync(1_000);
+
+      await assertion;
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  test("retries transient readiness reads without redispatching Create", async () => {
+    vi.useFakeTimers();
+    try {
+      const { kind: _kind, version: _version, ...runningResource } = sandboxRef;
+      const startingResource = {
+        ...runningResource,
+        status: "STARTING",
+        startedAt: undefined,
+      };
+      const methods: string[] = [];
+      let requestCount = 0;
+      const fetchMock: typeof fetch = vi.fn(async (_input, init) => {
+        requestCount++;
+        methods.push(init?.method ?? "GET");
+        if (requestCount === 1) {
+          return Response.json({ data: startingResource }, { status: 202 });
+        }
+        if (requestCount === 2) {
+          throw new TypeError("connection reset");
+        }
+        return Response.json({ data: runningResource });
+      });
+      const client = createSandboxClient({
+        baseUrl: () => "https://api.example.test",
+        apiKey: () => "signkey-test",
+        headers: () => ({}),
+        fetch: () => fetchMock,
+      });
+
+      const result = client.create({
+        ...createOptions,
+        runningTimeout: "5s",
+      });
+      await vi.advanceTimersByTimeAsync(1_000);
+
+      await expect(result).resolves.toMatchObject({
+        id: sandboxId,
+        status: "RUNNING",
+      });
+      expect(methods).toEqual(["POST", "GET", "GET"]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  test("polls a pausing sandbox without redispatching Pause", async () => {
+    vi.useFakeTimers();
+    try {
+      const { kind: _kind, version: _version, ...runningResource } = sandboxRef;
+      const pausingResource = { ...runningResource, status: "PAUSING" };
+      const pausedResource = { ...runningResource, status: "PAUSED" };
+      const sandboxPath = `/v2/sandboxes/${sandboxId}`;
+      const calls: Array<{ method: string; path: string }> = [];
+      let sandboxGetCount = 0;
+      const fetchMock: typeof fetch = vi.fn(async (input, init) => {
+        const url = new URL(input instanceof Request ? input.url : input);
+        const method = init?.method ?? "GET";
+        calls.push({ method, path: url.pathname });
+
+        if (url.pathname === sandboxPath && method === "GET") {
+          sandboxGetCount++;
+          return Response.json({
+            data:
+              sandboxGetCount === 1
+                ? runningResource
+                : sandboxGetCount === 2
+                  ? pausingResource
+                  : pausedResource,
+          });
+        }
+        if (url.pathname === `${sandboxPath}/pause` && method === "POST") {
+          return Response.json({ data: pausingResource });
+        }
+        throw new Error(`Unexpected request: ${method} ${url}`);
+      });
+      const client = createSandboxClient({
+        baseUrl: () => "https://api.example.test",
+        apiKey: () => "signkey-test",
+        headers: () => ({}),
+        fetch: () => fetchMock,
+      });
+
+      const sandbox = await client.get(sandboxId);
+      if (!sandbox) {
+        throw new Error("Expected sandbox");
+      }
+
+      const result = sandbox.pause({ timeout: "5s" });
+      await vi.advanceTimersByTimeAsync(2_000);
+
+      await expect(result).resolves.toMatchObject({
+        id: sandboxId,
+        status: "PAUSED",
+      });
+      expect(calls).toEqual([
+        { method: "GET", path: sandboxPath },
+        { method: "POST", path: `${sandboxPath}/pause` },
+        { method: "GET", path: sandboxPath },
+        { method: "GET", path: sandboxPath },
+      ]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  test("forwards the complete direct REST lifecycle", async () => {
+    const {
+      kind: _sandboxKind,
+      version: _sandboxVersion,
+      ...sandboxData
+    } = sandboxRef;
+    const {
+      kind: _processKind,
+      version: _processVersion,
+      sandboxId: _processSandboxId,
+      ...processData
+    } = processRef;
+    const sandboxPath = `/v2/sandboxes/${sandboxId}`;
+    const processPath = `${sandboxPath}/processes/${processId}`;
+    const calls: Array<{ url: URL; init?: RequestInit }> = [];
+    const fetchMock: typeof fetch = vi.fn(async (input, init) => {
+      const url = new URL(input instanceof Request ? input.url : input);
+      const method = init?.method ?? "GET";
+      calls.push({ url, init });
+
+      if (url.pathname === "/v2/sandboxes" && method === "GET") {
+        return Response.json({
+          data: [
+            {
+              ...sandboxData,
+              resources: {
+                ...sandboxData.resources,
+                futureResourceField: true,
+              },
+              futureSandboxField: true,
+            },
+          ],
+          metadata: { fetchedAt: now, futureMetadataField: true },
+          page: {
+            cursor: null,
+            hasMore: false,
+            limit: 10,
+            futurePageField: true,
+          },
+        });
+      }
+      if (url.pathname === sandboxPath && method === "GET") {
+        return Response.json({
+          data: { ...sandboxData, futureSandboxField: true },
+        });
+      }
+      if (url.pathname === `${sandboxPath}/exec` && method === "POST") {
+        return Response.json({
+          data: {
+            stdout: "AP8=",
+            stderr: "ZXJyCg==",
+            encoding: "base64",
+            exitCode: 7,
+            futureExecField: true,
+          },
+        });
+      }
+      if (url.pathname === `${sandboxPath}/logs` && method === "GET") {
+        return new Response(
+          `${JSON.stringify({
+            type: "log",
+            stream: "STDERR",
+            data: "AP8=",
+            encoding: "base64",
+            at: now,
+            futureChunkField: true,
+          })}\n`,
+        );
+      }
+      if (url.pathname === `${sandboxPath}/files` && method === "PUT") {
+        return Response.json({
+          data: {
+            path: "/tmp/result.bin",
+            bytesWritten: 2,
+            futureUploadField: true,
+          },
+        });
+      }
+      if (url.pathname === `${sandboxPath}/files` && method === "GET") {
+        return new Response(new Uint8Array([0, 255]), {
+          headers: { "Content-Type": "application/octet-stream" },
+        });
+      }
+      if (url.pathname === `${sandboxPath}/processes` && method === "POST") {
+        return Response.json(
+          { data: { ...processData, futureProcessField: true } },
+          { status: 201 },
+        );
+      }
+      if (url.pathname === `${sandboxPath}/processes` && method === "GET") {
+        return Response.json({
+          data: [{ ...processData, futureProcessField: true }],
+          metadata: { fetchedAt: now, futureMetadataField: true },
+          page: {
+            cursor: "next-process-page",
+            hasMore: true,
+            limit: 25,
+            futurePageField: true,
+          },
+        });
+      }
+      if (url.pathname === processPath && method === "GET") {
+        return Response.json({
+          data: { ...processData, futureProcessField: true },
+        });
+      }
+      if (url.pathname === `${processPath}/signals` && method === "POST") {
+        return new Response(null, { status: 204 });
+      }
+      if (url.pathname === `${processPath}/wait` && method === "POST") {
+        return Response.json({
+          data: {
+            id: processId,
+            state: "EXITED",
+            exitCode: 0,
+            futureWaitField: true,
+          },
+        });
+      }
+      if (url.pathname === `${processPath}/output` && method === "GET") {
+        return Response.json({
+          data: {
+            chunks: [
+              {
+                stream: "STDOUT",
+                data: "AP8=",
+                encoding: "base64",
+                at: now,
+                futureChunkField: true,
+              },
+            ],
+          },
+        });
+      }
+      if (url.pathname === sandboxPath && method === "DELETE") {
+        return Response.json(
+          { data: { ...sandboxData, status: "TERMINATING" } },
+          { status: 202 },
+        );
+      }
+      throw new Error(`Unexpected request: ${method} ${url}`);
+    });
+    const inngest = createClient({
+      id: testClientId,
+      signingKey: "signkey-test",
+      baseUrl: "https://api.example.test",
+      env: "branch",
+      fetch: fetchMock,
+    });
+
+    const listed = await inngest.sandboxes.list({
+      cursor: "opaque",
+      limit: 10,
+    });
+    const sandbox = await inngest.sandboxes.get(sandboxId);
+    if (!sandbox) {
+      throw new Error("Expected sandbox");
+    }
+    const command = await sandbox.commands.run("printf ok", {
+      timeout: "1s",
+    });
+    const logReader = (await sandbox.logs.stream({ follow: true })).getReader();
+    const log = await logReader.read();
+    const upload = await sandbox.files.upload({
+      path: "/tmp/result.bin",
+      data: new Uint8Array([0, 255]),
+      mode: 0o640,
+    });
+    const download = await sandbox.files.download({
+      path: "/tmp/result.bin",
+    });
+    const started = await sandbox.processes.start({
+      command: "sleep 30",
+    });
+    const processes = await sandbox.processes.list({
+      cursor: "process-cursor",
+      limit: 25,
+    });
+    const fetchedProcess = await sandbox.processes.get(processId);
+    await started.signal({ signal: 15 });
+    await started.signal({ signal: 9, includeChildren: false });
+    const waited = await started.wait({ timeout: "2s" });
+    const output = await started.getOutput({ tailBytes: 64 });
+    const destroyed = await sandbox.destroy();
+
+    expect(listed.items[0]).toMatchObject(sandboxRef);
+    expect(sandbox).toMatchObject(sandboxRef);
+    expect("attach" in inngest.sandboxes).toBe(false);
+    expect("toJSON" in sandbox).toBe(false);
+    expect("toJSON" in started).toBe(false);
+    expect("refresh" in sandbox).toBe(false);
+    expect(command).toEqual({
+      stdout: "\u0000�",
+      stderr: "err\n",
+      exitCode: 7,
+      output: { truncated: false },
+    });
+    expect(log).toEqual({
+      done: false,
+      value: {
+        stream: "STDERR",
+        data: new Uint8Array([0, 255]),
+        at: now,
+      },
+    });
+    expect(upload).toEqual({ path: "/tmp/result.bin", bytesWritten: 2 });
+    expect(new Uint8Array(await download.arrayBuffer())).toEqual(
+      new Uint8Array([0, 255]),
+    );
+    expect(started).toMatchObject(processRef);
+    expect("refresh" in started).toBe(false);
+    expect(processes.items[0]).toMatchObject(processRef);
+    expect(processes.page).toEqual({
+      cursor: "next-process-page",
+      hasMore: true,
+      limit: 25,
+    });
+    expect(processes.fetchedAt).toBe(now);
+    expect(fetchedProcess).toMatchObject(processRef);
+    expect(waited).toMatchObject({
+      id: processId,
+      state: "EXITED",
+      exitCode: 0,
+    });
+    expect(output.chunks[0]?.data).toEqual(new Uint8Array([0, 255]));
+    expect(destroyed).toMatchObject({
+      status: "TERMINATING",
+      sandbox: { id: sandboxId, status: "TERMINATING" },
+    });
+
+    expect(
+      calls.find(
+        ({ url, init }) =>
+          url.pathname.endsWith("/files") && init?.method === "PUT",
+      )?.url.search,
+    ).toBe("?path=%2Ftmp%2Fresult.bin&mode=0640");
+    expect(calls[0]?.url.search).toBe("?limit=10&cursor=opaque");
+    expect(
+      calls.find(
+        ({ url, init }) =>
+          url.pathname.endsWith("/processes") && init?.method === "GET",
+      )?.url.search,
+    ).toBe("?limit=25&cursor=process-cursor");
+    expect(calls[0]?.init?.headers).toMatchObject({
+      Authorization: `Bearer ${hashSigningKey("signkey-test")}`,
+      "x-inngest-env": "branch",
+    });
+    expect(
+      JSON.parse(
+        String(
+          calls.find(({ url }) => url.pathname.endsWith("/exec"))?.init?.body,
+        ),
+      ),
+    ).toMatchObject({
+      command: ["/bin/sh", "-c", "printf ok"],
+      timeout: "1000ms",
+    });
+    expect(
+      JSON.parse(
+        String(
+          calls.find(
+            ({ url, init }) =>
+              url.pathname.endsWith("/processes") && init?.method === "POST",
+          )?.init?.body,
+        ),
+      ),
+    ).toEqual({ command: ["/bin/sh", "-c", "sleep 30"] });
+    expect(
+      calls
+        .filter(({ url }) => url.pathname.endsWith("/signals"))
+        .map(({ init }) => JSON.parse(String(init?.body))),
+    ).toEqual([
+      { signal: 15, includeChildren: true },
+      { signal: 9, includeChildren: false },
+    ]);
+  });
+
+  test("defaults an omitted process list hasMore value to false", async () => {
+    const { kind: _kind, version: _version, ...sandboxData } = sandboxRef;
+    const sandboxPath = `/v2/sandboxes/${sandboxId}`;
+    const fetchMock: typeof fetch = vi.fn(async (input, init) => {
+      const url = new URL(input instanceof Request ? input.url : input);
+      const method = init?.method ?? "GET";
+      if (url.pathname === sandboxPath && method === "GET") {
+        return Response.json({ data: sandboxData });
+      }
+      if (url.pathname === `${sandboxPath}/processes` && method === "GET") {
+        return Response.json({
+          data: [],
+          metadata: { fetchedAt: now },
+          page: { limit: 50 },
+        });
+      }
+      throw new Error(`Unexpected request: ${method} ${url}`);
+    });
+    const client = createSandboxClient({
+      baseUrl: () => "https://api.example.test",
+      apiKey: () => "signkey-test",
+      headers: () => ({}),
+      fetch: () => fetchMock,
+    });
+
+    const sandbox = await client.get(sandboxId);
+    if (!sandbox) {
+      throw new Error("Expected sandbox");
+    }
+
+    await expect(sandbox.processes.list()).resolves.toMatchObject({
+      items: [],
+      page: { hasMore: false, limit: 50 },
+    });
+  });
+
+  test("defaults omitted process output chunks to an empty list", async () => {
+    const { kind: _kind, version: _version, ...sandboxData } = sandboxRef;
+    const sandboxPath = `/v2/sandboxes/${sandboxId}`;
+    const processPath = `${sandboxPath}/processes/${processId}`;
+    const {
+      kind: _processKind,
+      version: _processVersion,
+      sandboxId: _processSandbox,
+      ...processData
+    } = processRef;
+    const fetchMock: typeof fetch = vi.fn(async (input, init) => {
+      const url = new URL(input instanceof Request ? input.url : input);
+      const method = init?.method ?? "GET";
+      if (url.pathname === sandboxPath && method === "GET") {
+        return Response.json({ data: sandboxData });
+      }
+      if (url.pathname === processPath && method === "GET") {
+        return Response.json({ data: processData });
+      }
+      // A process that printed nothing: protobuf JSON omits the empty list.
+      if (url.pathname === `${processPath}/output` && method === "GET") {
+        return Response.json({ data: {}, metadata: { fetchedAt: now } });
+      }
+      throw new Error(`Unexpected request: ${method} ${url}`);
+    });
+    const client = createSandboxClient({
+      baseUrl: () => "https://api.example.test",
+      apiKey: () => "signkey-test",
+      headers: () => ({}),
+      fetch: () => fetchMock,
+    });
+
+    const sandbox = await client.get(sandboxId);
+    const process = await sandbox?.processes.get(processId);
+    if (!process) {
+      throw new Error("Expected process");
+    }
+
+    await expect(process.getOutput()).resolves.toEqual({ chunks: [] });
+  });
+
+  test("uses the REST v2 resource shape and decodes byte-safe streams", async () => {
+    const calls: Array<{ url: URL; init?: RequestInit }> = [];
+    const fetchMock: typeof fetch = vi.fn(async (input, init) => {
+      const url = new URL(input instanceof Request ? input.url : input);
+      calls.push({ url, init });
+
+      if (url.pathname === "/v2/sandboxes" && init?.method === "POST") {
+        return Response.json(
+          { data: { ...sandboxRef, kind: undefined, version: undefined } },
+          { status: 201 },
+        );
+      }
+      if (url.pathname.endsWith("/processes") && init?.method === "POST") {
+        const {
+          kind: _kind,
+          version: _version,
+          sandboxId: _sandbox,
+          ...data
+        } = processRef;
+        return Response.json({ data }, { status: 201 });
+      }
+      if (url.pathname.endsWith("/output/stream")) {
+        return new Response(
+          [
+            JSON.stringify({
+              type: "log",
+              stream: "STDOUT",
+              data: "AP8=",
+              encoding: "base64",
+              at: now,
+            }),
+            "",
+          ].join("\n"),
+          { headers: { "Content-Type": "application/x-ndjson" } },
+        );
+      }
+      throw new Error(`Unexpected request: ${init?.method} ${url}`);
+    });
+    const client = createSandboxClient({
+      baseUrl: () => "https://api.example.test",
+      apiKey: () => "signkey-test",
+      headers: () => ({ "X-Inngest-Env": "test" }),
+      fetch: () => fetchMock,
+    });
+
+    const sandbox = await client.create(createOptions);
+    const process = await sandbox.processes.start({
+      command: processRef.command,
+    });
+    const stream = await process.streamOutput({ tailBytes: 42 });
+    const chunks: Uint8Array[] = [];
+    const reader = stream.getReader();
+    for (;;) {
+      const next = await reader.read();
+      if (next.done) {
+        break;
+      }
+      chunks.push(next.value.data);
+    }
+
+    expect(sandbox).toMatchObject(sandboxRef);
+    expect(process).toMatchObject(processRef);
+    expect(chunks).toEqual([new Uint8Array([0, 255])]);
+    expect(calls.map(({ url }) => `${url.pathname}${url.search}`)).toEqual([
+      "/v2/sandboxes",
+      `/v2/sandboxes/${sandboxId}/processes`,
+      `/v2/sandboxes/${sandboxId}/processes/${processId}/output/stream?tailBytes=42`,
+    ]);
+    expect(calls[0]?.init?.headers).toMatchObject({
+      Authorization: "Bearer signkey-test",
+      "X-Inngest-Env": "test",
+    });
+  });
+
+  test.each([
+    [413, "sandbox_exec_output_too_large"],
+    [504, "sandbox_exec_timed_out"],
+  ])(
+    "marks an incomplete captured Exec result as ambiguous (%s)",
+    async (status, code) => {
+      let requestCount = 0;
+      const { kind: _kind, version: _version, ...sandboxResource } = sandboxRef;
+      const client = createSandboxClient({
+        baseUrl: () => "https://api.example.test",
+        apiKey: () => "key",
+        headers: () => ({}),
+        fetch: () => async () => {
+          requestCount++;
+          if (requestCount === 1) {
+            return Response.json({ data: sandboxResource });
+          }
+          return Response.json(
+            {
+              errors: [
+                {
+                  code,
+                  message: "The command may have executed",
+                },
+              ],
+            },
+            { status },
+          );
+        },
+      });
+
+      const sandbox = await client.get(sandboxId);
+      if (!sandbox) {
+        throw new Error("Expected sandbox");
+      }
+      await expect(sandbox.commands.run(["/bin/true"])).rejects.toMatchObject({
+        name: "SandboxError",
+        action: "exec",
+        code,
+        ambiguous: true,
+        retryable: false,
+      });
+    },
+  );
+
+  test("turns a terminal NDJSON error frame into a SandboxError", async () => {
+    let requestCount = 0;
+    const fetchMock: typeof fetch = vi.fn(async () => {
+      requestCount++;
+      if (requestCount === 1) {
+        const { kind: _kind, version: _version, ...data } = sandboxRef;
+        return Response.json({ data });
+      }
+      if (requestCount === 2) {
+        const {
+          kind: _kind,
+          version: _version,
+          sandboxId: _sandbox,
+          ...data
+        } = processRef;
+        return Response.json({ data });
+      }
+      return new Response(
+        `${JSON.stringify({
+          type: "error",
+          error: {
+            code: "compute_unavailable",
+            message: "node disconnected",
+          },
+        })}\n`,
+        { headers: { "Content-Type": "application/x-ndjson" } },
+      );
+    });
+    const client = createSandboxClient({
+      baseUrl: () => "https://api.example.test",
+      apiKey: () => "key",
+      headers: () => ({}),
+      fetch: () => fetchMock,
+    });
+    const sandbox = await client.get(sandboxId);
+    const process = await sandbox?.processes.get(processId);
+    const stream = await process?.streamOutput();
+
+    await expect(stream?.getReader().read()).rejects.toMatchObject({
+      name: "SandboxError",
+      action: "process.stream",
+      code: "compute_unavailable",
+      retryable: true,
+    });
+  });
+
+  test("aborts the HTTP response when a direct stream is cancelled", async () => {
+    let requestCount = 0;
+    let streamSignal: AbortSignal | undefined;
+    let responseCancelled = false;
+    const fetchMock: typeof fetch = vi.fn(async (_input, init) => {
+      requestCount++;
+      if (requestCount === 1) {
+        const { kind: _kind, version: _version, ...data } = sandboxRef;
+        return Response.json({ data });
+      }
+      if (requestCount === 2) {
+        const {
+          kind: _kind,
+          version: _version,
+          sandboxId: _sandbox,
+          ...data
+        } = processRef;
+        return Response.json({ data });
+      }
+      streamSignal = init?.signal ?? undefined;
+      return new Response(
+        new ReadableStream({
+          cancel: () => {
+            responseCancelled = true;
+          },
+        }),
+      );
+    });
+    const client = createSandboxClient({
+      baseUrl: () => "https://api.example.test",
+      apiKey: () => "key",
+      headers: () => ({}),
+      fetch: () => fetchMock,
+    });
+    const sandbox = await client.get(sandboxId);
+    const process = await sandbox?.processes.get(processId);
+    const stream = await process?.streamOutput();
+
+    await stream?.cancel();
+
+    expect(streamSignal?.aborted).toBe(true);
+    expect(responseCancelled).toBe(true);
+  });
+});

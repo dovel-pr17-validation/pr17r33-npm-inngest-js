@@ -1,0 +1,430 @@
+import stringify from "json-stringify-safe";
+import { z } from "zod/v3";
+import { NonRetriableError } from "../components/NonRetriableError.ts";
+import type { ClientOptions, OutgoingOp } from "../types.ts";
+
+const SERIALIZED_KEY = "__serialized";
+const SERIALIZED_VALUE = true;
+
+/**
+ * The properties preserved when serializing and deserializing errors, with
+ * the enumerability each has on a real `Error` instance.
+ */
+const copiedErrorProperties = [
+  { key: "name", enumerable: false },
+  { key: "message", enumerable: false },
+  { key: "stack", enumerable: false },
+  { key: "code", enumerable: true },
+  { key: "cause", enumerable: false },
+] as const;
+
+/**
+ * Add first-class support for certain errors that we control, in addition to
+ * built-in errors such as `TypeError`.
+ *
+ * Adding these allows these non-standard errors to be correctly serialized,
+ * sent to Inngest, then deserialized back into the correct error type for users
+ * to react to correctly.
+ *
+ * Note that these errors only support `message?: string | undefined` as the
+ * input; more custom errors are not supported with this current strategy.
+ *
+ * New public error classes are usually fine unregistered; deserialization
+ * falls back to `Error`. Only `name`, `message`, `stack`, `code`, and
+ * `cause` survive serialization either way, so register a factory only if
+ * users need `instanceof` checks in `onFailure` handlers.
+ */
+const errorFactories = new Map<string, () => Error>([
+  ["EvalError", () => new EvalError()],
+  ["RangeError", () => new RangeError()],
+  ["ReferenceError", () => new ReferenceError()],
+  ["SyntaxError", () => new SyntaxError()],
+  ["TypeError", () => new TypeError()],
+  ["URIError", () => new URIError()],
+  ["NonRetriableError", () => new NonRetriableError("")],
+]);
+
+// `name` and other error properties usually live on the prototype, so check
+// with `in` rather than own-property lookups.
+const pickErrorProperties = (subject: object): Record<string, unknown> => {
+  const result: Record<string, unknown> = {};
+
+  for (const { key } of copiedErrorProperties) {
+    if (Reflect.has(subject, key)) {
+      result[key] = Reflect.get(subject, key);
+    }
+  }
+
+  return result;
+};
+
+const reconstructError = (subject: object): Error => {
+  const name = Reflect.get(subject, "name");
+  const factory =
+    typeof name === "string" ? errorFactories.get(name) : undefined;
+
+  const output = factory ? factory() : new Error();
+
+  for (const { key, enumerable } of copiedErrorProperties) {
+    if (Reflect.has(subject, key)) {
+      Object.defineProperty(output, key, {
+        value: Reflect.get(subject, key),
+        enumerable,
+        configurable: true,
+        writable: true,
+      });
+    }
+  }
+
+  return output;
+};
+
+export interface SerializedError {
+  readonly name: string;
+  readonly message: string;
+  readonly stack: string;
+  readonly [SERIALIZED_KEY]: typeof SERIALIZED_VALUE;
+}
+
+/**
+ * Serialize an error to a plain, JSON-serializable object.
+ *
+ * Errors do not serialize nicely to JSON by default, so we use this function
+ * to convert them to a plain object, copying across the properties that
+ * matter (`name`, `message`, `stack`, and, where present, `code` and
+ * `cause`).
+ *
+ * This function also adds a marker property to the serialized error, so that
+ * we can distinguish between serialized errors and other objects.
+ *
+ * Will not reserialize existing serialized errors.
+ */
+export const serializeError = <
+  TAllowUnknown extends boolean = false,
+  TOutput extends TAllowUnknown extends true
+    ? unknown
+    : SerializedError = TAllowUnknown extends true ? unknown : SerializedError,
+>(
+  /**
+   * The suspected error to serialize.
+   */
+  subject: unknown,
+
+  /**
+   * If `true` and the error is not serializable, will return the original value
+   * as `unknown` instead of coercing it to a serialized error.
+   */
+  allowUnknown: TAllowUnknown = false as TAllowUnknown,
+): TOutput => {
+  try {
+    // Try to understand if this is already done.
+    // Will handle stringified errors.
+    const existingSerializedError = isSerializedError(subject);
+
+    if (existingSerializedError) {
+      return existingSerializedError as TOutput;
+    }
+
+    if (typeof subject === "object" && subject !== null) {
+      // Is an object, so let's try and serialize it.
+      const serializedErr = pickErrorProperties(subject);
+
+      // Not a proper error was caught, so give us a chance to return `unknown`.
+      if (!serializedErr.name && allowUnknown) {
+        return subject as TOutput;
+      }
+
+      // Serialization can succeed but assign no name or message, so we'll
+      // map over the result here to ensure we have everything.
+      // We'll just stringify the entire subject for the message, as this at
+      // least provides some context for the user.
+      const ret = {
+        // Ensure we spread to also capture additional properties such as
+        // `cause`.
+        ...serializedErr,
+
+        name: serializedErr.name || "Error",
+        message:
+          serializedErr.message ||
+          stringify(subject) ||
+          "Unknown error; error serialization could not find a message.",
+        stack: serializedErr.stack || "",
+        [SERIALIZED_KEY]: SERIALIZED_VALUE,
+      } as const;
+
+      // If we have a cause, make sure we recursively serialize them too. We are
+      // lighter with causes though; attempt to recursively serialize them, but
+      // stop if we find something that doesn't work and just return `unknown`.
+      // Values that come back unserialized are copied before we walk into
+      // them, so we never mutate objects the caller still holds.
+      let target: object = ret;
+      const maxDepth = 5;
+      for (let i = 0; i < maxDepth; i++) {
+        if (!("cause" in target) || !target.cause) {
+          break;
+        }
+
+        const serializedCause = serializeError(target.cause, true);
+
+        if (typeof serializedCause !== "object" || serializedCause === null) {
+          target.cause = serializedCause;
+          break;
+        }
+
+        const next =
+          serializedCause === target.cause
+            ? { ...serializedCause }
+            : serializedCause;
+
+        target.cause = next;
+        target = next;
+      }
+
+      return ret as TOutput;
+    }
+
+    // If it's not an object, it's hard to parse this as an Error. In this case,
+    // we'll throw an error to start attempting backup strategies.
+    throw new Error("Error is not an object; strange throw value.");
+  } catch {
+    if (allowUnknown) {
+      // If we are allowed to return unknown, we'll just return the original
+      // value.
+      return subject as TOutput;
+    }
+
+    try {
+      // If serialization fails, fall back to a regular Error and use the
+      // original object as the message for an Error. We don't know what this
+      // object looks like, so we can't do anything else with it.
+      return {
+        ...serializeError(
+          new Error(typeof subject === "string" ? subject : stringify(subject)),
+          false,
+        ),
+        // Remove the stack; it's not relevant here
+        stack: "",
+        [SERIALIZED_KEY]: SERIALIZED_VALUE,
+      } as TOutput;
+    } catch {
+      // If this failed, then stringifying the object also failed, so we'll just
+      // return a completely generic error.
+      // Failing to stringify the object is very unlikely.
+      return {
+        name: "Could not serialize source error",
+        message: "Serializing the source error failed.",
+        stack: "",
+        [SERIALIZED_KEY]: SERIALIZED_VALUE,
+      } as TOutput;
+    }
+  }
+};
+
+const serializedErrorSchema = z
+  .object({
+    [SERIALIZED_KEY]: z.literal(SERIALIZED_VALUE),
+    name: z.string(),
+    message: z.string(),
+    stack: z.string(),
+  })
+  .passthrough();
+
+/**
+ * Check if an object or a string is a serialised error created by
+ * {@link serializeError}.
+ */
+export const isSerializedError = (
+  value: unknown,
+): SerializedError | undefined => {
+  try {
+    if (typeof value === "string") {
+      const parsed = serializedErrorSchema.safeParse(JSON.parse(value));
+
+      if (parsed.success) {
+        return parsed.data as SerializedError;
+      }
+    }
+
+    if (typeof value === "object" && value !== null) {
+      const objIsSerializedErr =
+        Object.hasOwn(value, SERIALIZED_KEY) &&
+        (value as { [SERIALIZED_KEY]: unknown })[SERIALIZED_KEY] ===
+          SERIALIZED_VALUE;
+
+      if (objIsSerializedErr) {
+        return value as SerializedError;
+      }
+    }
+  } catch {
+    // no-op; we'll return undefined if parsing failed, as it isn't a serialized
+    // error
+  }
+
+  return;
+};
+
+/**
+ * Deserialise an error created by {@link serializeError}.
+ *
+ * Ensures we only deserialise errors that meet a minimum level of
+ * applicability, inclusive of error handling to ensure that badly serialized
+ * errors are still handled.
+ */
+export const deserializeError = <
+  TAllowUnknown extends boolean = false,
+  TOutput extends TAllowUnknown extends true
+    ? unknown
+    : Error = TAllowUnknown extends true ? unknown : Error,
+>(
+  subject: Partial<SerializedError>,
+  allowUnknown: TAllowUnknown = false as TAllowUnknown,
+): TOutput => {
+  const requiredFields: (keyof SerializedError)[] = ["name", "message"];
+
+  try {
+    const hasRequiredFields = requiredFields.every((field) => {
+      return Object.hasOwn(subject, field);
+    });
+
+    if (!hasRequiredFields) {
+      throw new Error();
+    }
+
+    const deserializedErr = reconstructError(subject);
+
+    if ("cause" in deserializedErr) {
+      deserializedErr.cause = deserializeError(
+        deserializedErr.cause as Partial<SerializedError>,
+        true,
+      );
+    }
+
+    return deserializedErr as TOutput;
+  } catch {
+    if (allowUnknown) {
+      // If we are allowed to return unknown, we'll just return the original
+      // value.
+      return subject as TOutput;
+    }
+
+    const err = new Error("Unknown error; could not reserialize");
+
+    /**
+     * Remove the stack so that it's not misleadingly shown as the Inngest
+     * internals.
+     */
+    err.stack = undefined;
+
+    return err as TOutput;
+  }
+};
+
+export enum ErrCode {
+  NESTING_STEPS = "NESTING_STEPS",
+
+  /**
+   * Legacy v0 execution error code for when a function has changed and no
+   * longer matches its in-progress state.
+   *
+   * @deprecated Not for use in latest execution method.
+   */
+  NON_DETERMINISTIC_FUNCTION = "NON_DETERMINISTIC_FUNCTION",
+
+  /**
+   * Legacy v0 execution error code for when a function is found to be using
+   * async actions after memoziation has occurred, which v0 doesn't support.
+   *
+   * @deprecated Not for use in latest execution method.
+   */
+  ASYNC_DETECTED_AFTER_MEMOIZATION = "ASYNC_DETECTED_AFTER_MEMOIZATION",
+
+  /**
+   * Legacy v0 execution error code for when a function is found to be using
+   * steps after a non-step async action has occurred.
+   *
+   * @deprecated Not for use in latest execution method.
+   */
+  STEP_USED_AFTER_ASYNC = "STEP_USED_AFTER_ASYNC",
+
+  AUTOMATIC_PARALLEL_INDEXING = "AUTOMATIC_PARALLEL_INDEXING",
+
+  NONDETERMINISTIC_STEPS = "NONDETERMINISTIC_STEPS",
+}
+
+/**
+ * Given an `unknown` object, retrieve the `message` property from it, or fall
+ * back to the `fallback` string if it doesn't exist or is empty.
+ */
+export const getErrorMessage = (err: unknown, fallback: string): string => {
+  const { message } = z
+    .object({ message: z.string().min(1) })
+    .catch({ message: fallback })
+    .parse(err);
+
+  return message;
+};
+
+export const fixEventKeyMissingSteps = [
+  "Set the `INNGEST_EVENT_KEY` environment variable",
+  `Pass a key to the \`new Inngest()\` constructor using the \`${
+    "eventKey" satisfies keyof ClientOptions
+  }\` option`,
+];
+
+/**
+ * An error that, when thrown, indicates internally that an outgoing operation
+ * contains an error.
+ *
+ * We use this because serialized `data` sent back to Inngest may differ from
+ * the error instance itself due to middleware.
+ *
+ * @internal
+ */
+export class OutgoingResultError extends Error {
+  public readonly result: Pick<OutgoingOp, "data" | "error">;
+
+  constructor(result: Pick<OutgoingOp, "data" | "error">) {
+    super("OutgoingOpError");
+    this.result = result;
+  }
+}
+
+/**
+ * Create a function that will rethrow an error with a prefix added to the
+ * message.
+ *
+ * Useful for adding context to errors that are rethrown.
+ *
+ * @example
+ * ```ts
+ * await doSomeAction().catch(rethrowError("Failed to do some action"));
+ * ```
+ */
+// biome-ignore lint/suspicious/noExplicitAny: intentional
+export const rethrowError = (prefix: string): ((err: any) => never) => {
+  return (err) => {
+    try {
+      err.message &&= `${prefix}; ${err.message}`;
+    } catch (_noopErr) {
+      // no-op
+    } finally {
+      // biome-ignore lint/correctness/noUnsafeFinally: intentional
+      throw err;
+    }
+  };
+};
+
+/**
+ * An error that indicates that a code path that was thought to be unreachable
+ * has been reached.
+ *
+ * This is useful for exhaustiveness checks in places where we think we've
+ * handled all possible cases, but want to be sure that if we haven't, we get a
+ * clear error.
+ */
+export class UnreachableError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "UnreachableError";
+  }
+}

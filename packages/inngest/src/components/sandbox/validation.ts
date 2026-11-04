@@ -1,0 +1,1047 @@
+import { z } from "zod/v3";
+
+import { durationToMs } from "../../helpers/duration.ts";
+import { isSandboxImage, type SandboxImage } from "./image.ts";
+import {
+  type SandboxCommand,
+  type SandboxCommandOptions,
+  type SandboxCreateOptions,
+  type SandboxDuration,
+  type SandboxFileDownloadOptions,
+  type SandboxFileUploadOptions,
+  type SandboxListOptions,
+  type SandboxOutputChunk,
+  type SandboxProcessOutputOptions,
+  type SandboxProcessRef,
+  type SandboxProcessSignalOptions,
+  type SandboxProcessStartOptions,
+  type SandboxProcessWaitOptions,
+  type SandboxRef,
+  type SandboxSnapshotCreateOptions,
+  type SandboxSnapshotListOptions,
+  type SandboxSnapshotRef,
+  type SandboxSnapshotWaitOptions,
+  SandboxValidationError,
+  type SandboxWaitUntilRunningOptions,
+} from "./types.ts";
+
+export const maxSandboxProcessTimeoutMs = 5 * 60 * 1_000;
+export const defaultSandboxProcessTimeoutMs = 30 * 1_000;
+export const maxSandboxRunningTimeoutMs = 5 * 60 * 1_000;
+export const defaultSandboxRunningTimeoutMs = 120 * 1_000;
+export const maxSandboxSnapshotWaitTimeoutMs = 5 * 60 * 1_000;
+export const maxSandboxProcessTailBytes = 512 * 1_024;
+
+const maxProcessArgvCount = 128;
+const maxProcessArgvBytes = 32 * 1_024;
+const maxProcessEnvCount = 256;
+const maxProcessEnvBytes = 64 * 1_024;
+const maxProcessCwdBytes = 4_096;
+const maxProcessWireBytes = 96 * 1_024;
+const maxSandboxNameCharacters = 255;
+const sandboxNameControlCharacterPattern = /\p{Cc}/u;
+const sandboxNameEdgeWhitespacePattern = /^\p{White_Space}|\p{White_Space}$/u;
+const textEncoder = new TextEncoder();
+
+const imageDigestSchema = z
+  .string()
+  .length(71)
+  .regex(/^sha256:[a-f0-9]{64}$/);
+// Mirrors the image catalog's names, tags, and artifact digests. Explicit
+// selections cannot use the legacy "default" alias or fall back to it.
+export const sandboxImageSchema = z.string().refine((image) => {
+  if (image !== image.trim()) {
+    return false;
+  }
+  if (image.startsWith("sha256:")) {
+    return imageDigestSchema.safeParse(image).success;
+  }
+  if (image.split(/[:@]/)[0] === "default") {
+    return false;
+  }
+  return /^(?:inngest\/)?[a-z0-9][a-z0-9._-]{0,62}(?::[a-z0-9][a-z0-9._-]{0,127}|@sha256:[a-f0-9]{64})?$/.test(
+    image,
+  );
+}, "must be a published image name[:tag], name@sha256:<hex>, or sha256:<hex>");
+
+export const sandboxSecretNameSchema = z.string().superRefine((name, ctx) => {
+  if (
+    name.length === 0 ||
+    textEncoder.encode(name).byteLength > 256 ||
+    sandboxNameEdgeWhitespacePattern.test(name) ||
+    /[\r\n\0]/u.test(name)
+  ) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      message:
+        "must be a nonempty workspace secret name of at most 256 bytes without leading/trailing whitespace, CR, LF, or NUL",
+    });
+  }
+});
+
+export const sandboxNameSchema = z.string().superRefine((name, ctx) => {
+  if (name.length === 0) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      message: "must not be empty",
+    });
+  } else if ([...name].length > maxSandboxNameCharacters) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      message: `must not exceed ${maxSandboxNameCharacters} characters`,
+    });
+  }
+  if (sandboxNameEdgeWhitespacePattern.test(name)) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      message: "must not contain leading or trailing whitespace",
+    });
+  }
+  if (sandboxNameControlCharacterPattern.test(name)) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      message: "must not contain control characters",
+    });
+  }
+});
+
+const goJSONBytes = (value: unknown): number => {
+  // encoding/json escapes these runes by default. Simcity measures the
+  // marshalled ProcessSpec, so mirror Go rather than JSON.stringify exactly.
+  const encoded = JSON.stringify(value).replace(
+    /[<>&\u2028\u2029]/g,
+    (character) =>
+      `\\u${character.charCodeAt(0).toString(16).padStart(4, "0")}`,
+  );
+  return textEncoder.encode(encoded).byteLength;
+};
+
+const assertNoNul = (value: string, context: string): void => {
+  if (value.includes("\0")) {
+    throw new SandboxValidationError(`${context} must not contain NUL`);
+  }
+};
+
+const assertValidUnicode = (value: string, context: string): void => {
+  for (let index = 0; index < value.length; index++) {
+    const codeUnit = value.charCodeAt(index);
+    if (codeUnit >= 0xd800 && codeUnit <= 0xdbff) {
+      const next = value.charCodeAt(index + 1);
+      if (next < 0xdc00 || next > 0xdfff) {
+        throw new SandboxValidationError(
+          `${context} must not contain an unpaired surrogate`,
+        );
+      }
+      index++;
+    } else if (codeUnit >= 0xdc00 && codeUnit <= 0xdfff) {
+      throw new SandboxValidationError(
+        `${context} must not contain an unpaired surrogate`,
+      );
+    }
+  }
+};
+
+const validateSandboxEnvironment = (
+  environment: Record<string, string> | undefined,
+): Array<[string, string]> => {
+  const entries = Object.entries(environment ?? {});
+  if (entries.length > maxProcessEnvCount) {
+    throw new SandboxValidationError(
+      `environment must not contain more than ${maxProcessEnvCount} entries`,
+    );
+  }
+  let environmentBytes = 0;
+  for (const [key, value] of entries) {
+    if (!key || key.includes("=")) {
+      throw new SandboxValidationError(
+        "environment keys must be nonempty and must not contain '='",
+      );
+    }
+    assertNoNul(key, `environment key ${key}`);
+    assertNoNul(value, `environment.${key}`);
+    assertValidUnicode(key, `environment key ${key}`);
+    assertValidUnicode(value, `environment.${key}`);
+    environmentBytes +=
+      textEncoder.encode(key).byteLength +
+      1 +
+      textEncoder.encode(value).byteLength;
+  }
+  if (environmentBytes > maxProcessEnvBytes) {
+    throw new SandboxValidationError(
+      `environment must not exceed ${maxProcessEnvBytes} bytes`,
+    );
+  }
+  return entries;
+};
+
+export const canonicalUuidSchema = z
+  .string()
+  .regex(
+    /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/,
+    "must be a canonical lowercase UUID",
+  )
+  .refine((value) => value !== "00000000-0000-0000-0000-000000000000", {
+    message: "must not be the nil UUID",
+  });
+
+const timestampSchema = z
+  .string()
+  .regex(
+    /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?(?:Z|[+-]\d{2}:\d{2})$/,
+    "must be an RFC3339 timestamp",
+  )
+  .refine((value) => Number.isFinite(Date.parse(value)), {
+    message: "must be an RFC3339 timestamp",
+  });
+
+// Sandbox REST responses may use proto3 JSON, which omits zero values and
+// encodes 64-bit integers as decimal strings.
+const wireUint32Schema = z
+  .number()
+  .int()
+  .nonnegative()
+  .max(0xffffffff)
+  .default(0);
+const wireUint64Schema = z
+  .union([z.number(), z.string().regex(/^\d+$/).transform(Number)])
+  .pipe(z.number().int().nonnegative().safe())
+  .default(0);
+
+export const sandboxStatusSchema = z.enum([
+  "PENDING",
+  "STARTING",
+  "PAUSING",
+  "RUNNING",
+  "PAUSED",
+  "RESUMING",
+  "TERMINATING",
+  "TERMINATED",
+  "FAILED",
+]);
+
+const sandboxResourcesSchema = z
+  .object({
+    vcpu: z.number().int().positive().max(0xffffffff),
+    memoryMb: z.number().int().positive().max(0xffffffff),
+  })
+  .strict();
+
+export const sandboxResourceSchema = z
+  .object({
+    id: canonicalUuidSchema,
+    name: sandboxNameSchema,
+    status: sandboxStatusSchema,
+    vpcId: canonicalUuidSchema,
+    imageRef: z.string().min(1),
+    imageDigest: imageDigestSchema.optional(),
+    resources: sandboxResourcesSchema,
+    createdAt: timestampSchema,
+    startedAt: timestampSchema.optional(),
+    endedAt: timestampSchema.optional(),
+    error: z.string().min(1).optional(),
+  })
+  .strict();
+
+const wireSandboxResourceSchema = sandboxResourceSchema
+  .omit({ resources: true, startedAt: true, endedAt: true, error: true })
+  .extend({
+    resources: sandboxResourcesSchema.strip(),
+    startedAt: timestampSchema.nullish(),
+    endedAt: timestampSchema.nullish(),
+    error: z.string().min(1).nullish(),
+  })
+  .strip();
+
+export const sandboxRefSchema = sandboxResourceSchema
+  .extend({
+    kind: z.literal("inngest/sandbox"),
+    version: z.literal(1),
+  })
+  .strict();
+
+export const sandboxSnapshotStatusSchema = z.enum([
+  "CREATING",
+  "READY",
+  "DELETING",
+  "DELETED",
+  "FAILED",
+  "LOST",
+]);
+
+const sandboxSnapshotResourceBaseSchema = z
+  .object({
+    id: canonicalUuidSchema,
+    name: sandboxNameSchema.optional(),
+    sourceImageId: z.string().min(1),
+    status: sandboxSnapshotStatusSchema,
+    compatibilityId: z.string().min(1).optional(),
+    resources: sandboxResourcesSchema,
+    memoryPackCount: z.number().int().nonnegative().max(0xffffffff),
+    diskPackCount: z.number().int().nonnegative().max(0xffffffff),
+    storedBytes: z.number().int().nonnegative().safe(),
+    createdAt: timestampSchema,
+    updatedAt: timestampSchema,
+    expiresAt: timestampSchema,
+    error: z.string().min(1).optional(),
+  })
+  .strict();
+
+const validateSandboxSnapshotResource = (
+  snapshot: {
+    status: z.infer<typeof sandboxSnapshotStatusSchema>;
+    compatibilityId?: string;
+    sourceImageId: string;
+  },
+  ctx: z.RefinementCtx,
+): void => {
+  if (snapshot.status === "READY" && snapshot.compatibilityId === undefined) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      message: "compatibilityId is required for READY snapshots",
+      path: ["compatibilityId"],
+    });
+  }
+  if (
+    snapshot.status === "READY" &&
+    !/^[a-f0-9]{64}$/.test(snapshot.sourceImageId)
+  ) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      message:
+        "Source image ID must be a lowercase SHA-256 for READY snapshots",
+      path: ["sourceImageId"],
+    });
+  }
+};
+
+export const sandboxSnapshotResourceSchema =
+  sandboxSnapshotResourceBaseSchema.superRefine(
+    validateSandboxSnapshotResource,
+  );
+
+const wireSandboxSnapshotResourceSchema = sandboxSnapshotResourceBaseSchema
+  .omit({ name: true, resources: true, error: true })
+  .extend({
+    // Unnamed snapshots may omit the name, send null, or send "".
+    name: z.union([z.literal(""), sandboxNameSchema]).nullish(),
+    resources: sandboxResourcesSchema.strip(),
+    memoryPackCount: wireUint32Schema,
+    diskPackCount: wireUint32Schema,
+    storedBytes: wireUint64Schema,
+    error: z.string().min(1).nullish(),
+  })
+  .strip()
+  .superRefine(validateSandboxSnapshotResource);
+
+export const sandboxSnapshotRefSchema = sandboxSnapshotResourceBaseSchema
+  .extend({
+    kind: z.literal("inngest/sandbox.snapshot"),
+    version: z.literal(1),
+  })
+  .strict()
+  .superRefine(validateSandboxSnapshotResource);
+
+export const sandboxProcessStateSchema = z.enum([
+  "STARTING",
+  "RUNNING",
+  "EXITED",
+  "KILLED",
+  "FAILED",
+  "LOST",
+]);
+
+const sandboxProcessResourceShape = {
+  id: canonicalUuidSchema,
+  command: z.array(z.string()).min(1).max(maxProcessArgvCount),
+  pid: z.number().int().positive().max(0x7fffffff).optional(),
+  state: sandboxProcessStateSchema,
+  exitCode: z.number().int().min(-0x80000000).max(0x7fffffff).optional(),
+  terminationSignal: z.number().int().min(1).max(64).optional(),
+  startedAt: timestampSchema.optional(),
+  endedAt: timestampSchema.optional(),
+};
+
+const validateSandboxProcessResource = (
+  process: z.infer<z.ZodObject<typeof sandboxProcessResourceShape>>,
+  ctx: z.RefinementCtx,
+): void => {
+  if ((process.state === "EXITED") !== (process.exitCode !== undefined)) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      message: "exitCode must be present only for EXITED processes",
+      path: ["exitCode"],
+    });
+  }
+  if (
+    (process.state === "KILLED") !==
+    (process.terminationSignal !== undefined)
+  ) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      message: "terminationSignal must be present only for KILLED processes",
+      path: ["terminationSignal"],
+    });
+  }
+};
+
+export const sandboxProcessResourceSchema = z
+  .object(sandboxProcessResourceShape)
+  .strict()
+  .superRefine(validateSandboxProcessResource);
+
+const wireSandboxProcessResourceSchema = z
+  .object(sandboxProcessResourceShape)
+  .strip()
+  .superRefine(validateSandboxProcessResource);
+
+export const sandboxProcessRefSchema = z
+  .object({
+    kind: z.literal("inngest/sandbox.process"),
+    version: z.literal(1),
+    sandboxId: canonicalUuidSchema,
+    id: canonicalUuidSchema,
+    command: z.array(z.string()).min(1).max(maxProcessArgvCount),
+    pid: z.number().int().positive().max(0x7fffffff).optional(),
+    state: sandboxProcessStateSchema,
+    exitCode: z.number().int().min(-0x80000000).max(0x7fffffff).optional(),
+    terminationSignal: z.number().int().min(1).max(64).optional(),
+    startedAt: timestampSchema.optional(),
+    endedAt: timestampSchema.optional(),
+  })
+  .strict()
+  .superRefine((process, ctx) => {
+    if ((process.state === "EXITED") !== (process.exitCode !== undefined)) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: "exitCode must be present only for EXITED processes",
+        path: ["exitCode"],
+      });
+    }
+    if (
+      (process.state === "KILLED") !==
+      (process.terminationSignal !== undefined)
+    ) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: "terminationSignal must be present only for KILLED processes",
+        path: ["terminationSignal"],
+      });
+    }
+  });
+
+export const outputEncodingSchema = z.enum(["utf8", "base64"]);
+
+export type SandboxOutputEncoding = z.infer<typeof outputEncodingSchema>;
+
+const outputChunkShape = {
+  stream: z.enum(["STDOUT", "STDERR"]),
+  data: z.string(),
+  encoding: outputEncodingSchema,
+  at: timestampSchema.optional(),
+};
+
+export const wireOutputChunkSchema = z.object(outputChunkShape).strict();
+export const restOutputChunkSchema = z
+  .object({ ...outputChunkShape, data: z.string().default("") })
+  .strip();
+
+const formatValidationError = (context: string, error: z.ZodError): string => {
+  const issue = error.issues[0];
+  const path = issue?.path.length ? ` at ${issue.path.join(".")}` : "";
+  return `Invalid ${context}${path}: ${issue?.message ?? "validation failed"}`;
+};
+
+export const parseWithSchema = <T, Input = T>(
+  schema: z.ZodType<T, z.ZodTypeDef, Input>,
+  value: unknown,
+  context: string,
+): T => {
+  const parsed = schema.safeParse(value);
+  if (!parsed.success) {
+    throw new SandboxValidationError(
+      formatValidationError(context, parsed.error),
+      { cause: parsed.error },
+    );
+  }
+  return parsed.data;
+};
+
+export const sandboxRefFromResource = (value: unknown): SandboxRef => {
+  const resource = parseWithSchema(
+    wireSandboxResourceSchema,
+    value,
+    "sandbox resource",
+  );
+  return {
+    kind: "inngest/sandbox",
+    version: 1,
+    id: resource.id,
+    name: resource.name,
+    status: resource.status,
+    vpcId: resource.vpcId,
+    imageRef: resource.imageRef,
+    ...(resource.imageDigest !== undefined && {
+      imageDigest: resource.imageDigest,
+    }),
+    resources: resource.resources,
+    createdAt: resource.createdAt,
+    ...(resource.startedAt != null && { startedAt: resource.startedAt }),
+    ...(resource.endedAt != null && { endedAt: resource.endedAt }),
+    ...(resource.error != null && { error: resource.error }),
+  };
+};
+
+export const sandboxProcessRefFromResource = (
+  sandboxId: string,
+  value: unknown,
+): SandboxProcessRef =>
+  parseWithSchema(
+    sandboxProcessRefSchema,
+    {
+      kind: "inngest/sandbox.process",
+      version: 1,
+      sandboxId,
+      ...parseWithSchema(
+        wireSandboxProcessResourceSchema,
+        value,
+        "sandbox process resource",
+      ),
+    },
+    "sandbox process reference",
+  );
+
+export const sandboxSnapshotRefFromResource = (
+  value: unknown,
+): SandboxSnapshotRef => {
+  const resource = parseWithSchema(
+    wireSandboxSnapshotResourceSchema,
+    value,
+    "sandbox snapshot resource",
+  );
+  const { name, error, ...base } = resource;
+  return {
+    kind: "inngest/sandbox.snapshot",
+    version: 1,
+    ...base,
+    ...(name && { name }),
+    ...(error != null && { error }),
+  };
+};
+
+export const normalizeSandboxCreateOptions = (
+  options: SandboxCreateOptions,
+): Omit<SandboxCreateOptions, "runningTimeout"> & {
+  runningTimeoutMs: number | false;
+} => {
+  const parsed = parseWithSchema(
+    z.union([
+      z
+        .object({
+          name: sandboxNameSchema,
+          vcpu: z.number().int().positive().max(0xffffffff),
+          memoryMb: z.number().int().positive().max(0xffffffff),
+          image: sandboxImageSchema.optional(),
+          from: z
+            .custom<SandboxImage>(isSandboxImage, "must be made by `image`")
+            .optional(),
+          environment: z.record(z.string()).optional(),
+          secrets: z.array(sandboxSecretNameSchema).optional(),
+          runningTimeout: z.unknown().optional(),
+        })
+        .strict(),
+      z
+        .object({
+          name: sandboxNameSchema,
+          snapshotId: canonicalUuidSchema,
+          runningTimeout: z.unknown().optional(),
+        })
+        .strict(),
+    ]),
+    options,
+    "sandbox create options",
+  );
+  if ("vcpu" in parsed) {
+    const environment = { ...parsed.environment };
+    const selected = new Set<string>();
+    for (const name of parsed.secrets ?? []) {
+      if (Object.hasOwn(parsed.environment ?? {}, name)) {
+        throw new SandboxValidationError(
+          "secrets must not overlap with environment",
+        );
+      }
+      if (selected.has(name)) {
+        throw new SandboxValidationError(
+          "secrets must not contain duplicate names",
+        );
+      }
+      selected.add(name);
+      Object.defineProperty(environment, name, { value: "", enumerable: true });
+    }
+    validateSandboxEnvironment(environment);
+  }
+  const { runningTimeout, from, ...create } = { from: undefined, ...parsed };
+  if (from !== undefined && "image" in create && create.image !== undefined) {
+    throw new SandboxValidationError("use either `from` or `image`, not both");
+  }
+  return {
+    ...create,
+    ...(from !== undefined && {
+      image: parseWithSchema(sandboxImageSchema, from.ref, "sandbox image"),
+    }),
+    runningTimeoutMs:
+      runningTimeout === false
+        ? false
+        : normalizeDurationMs(
+            runningTimeout ?? defaultSandboxRunningTimeoutMs,
+            maxSandboxRunningTimeoutMs,
+            "runningTimeout",
+          ),
+  };
+};
+
+export const normalizeSandboxWaitUntilRunningOptions = (
+  options: SandboxWaitUntilRunningOptions,
+): { timeoutMs: number } => {
+  const parsed = parseWithSchema(
+    z.object({ timeout: z.unknown() }).strict(),
+    options,
+    "sandbox waitUntilRunning options",
+  );
+  return {
+    timeoutMs: normalizeDurationMs(
+      parsed.timeout,
+      maxSandboxRunningTimeoutMs,
+      "timeout",
+    ),
+  };
+};
+
+const sandboxListOptionsSchema = z
+  .object({
+    cursor: z.string().min(1).optional(),
+    limit: z.number().int().min(1).max(250).optional(),
+  })
+  .strict();
+
+export const normalizeSandboxListOptions = (
+  options: SandboxListOptions = {},
+): Required<Pick<SandboxListOptions, "limit">> &
+  Pick<SandboxListOptions, "cursor"> => {
+  const parsed = parseWithSchema(
+    sandboxListOptionsSchema,
+    options,
+    "sandbox list options",
+  );
+  return { ...parsed, limit: parsed.limit ?? 50 };
+};
+
+export const normalizeSandboxProcessListOptions = normalizeSandboxListOptions;
+
+type SandboxProcessSpecOptions = SandboxCommandOptions & {
+  command: SandboxCommand;
+};
+
+export const sandboxSnapshotCreateOptionsSchema = z
+  .object({ name: sandboxNameSchema.optional() })
+  .strict();
+
+export const normalizeSandboxSnapshotListOptions = (
+  options: SandboxSnapshotListOptions = {},
+): Required<Pick<SandboxSnapshotListOptions, "limit">> &
+  Pick<SandboxSnapshotListOptions, "cursor" | "name"> => {
+  const { name, ...list } = parseWithSchema(
+    sandboxListOptionsSchema
+      .extend({ name: sandboxNameSchema.optional() })
+      .strict(),
+    options,
+    "sandbox snapshot list options",
+  );
+
+  return {
+    ...normalizeSandboxListOptions(list),
+    ...(name !== undefined && { name }),
+  };
+};
+
+export const normalizeSandboxSnapshotCreateOptions = (
+  options: SandboxSnapshotCreateOptions = {},
+): SandboxSnapshotCreateOptions =>
+  parseWithSchema(
+    sandboxSnapshotCreateOptionsSchema,
+    options,
+    "sandbox snapshot create options",
+  );
+
+export const normalizeSandboxSnapshotWaitOptions = (
+  options: SandboxSnapshotWaitOptions,
+): { timeoutMs: number } => {
+  const parsed = parseWithSchema(
+    z.object({ timeout: z.unknown() }).strict(),
+    options,
+    "sandbox snapshot waitUntilReady options",
+  );
+  return {
+    timeoutMs: normalizeDurationMs(
+      parsed.timeout as SandboxDuration,
+      maxSandboxSnapshotWaitTimeoutMs,
+      "timeout",
+    ),
+  };
+};
+
+const normalizeProcessSpec = <
+  T extends SandboxProcessSpecOptions | SandboxProcessStartOptions,
+>(
+  options: T,
+  includeTimeout: boolean,
+): Omit<T, "command"> & { command: string[] } => {
+  const parsed = parseWithSchema(
+    z
+      .object({
+        command: z.union([
+          z.string().min(1, "command must not be empty"),
+          z.array(z.string()).min(1).max(maxProcessArgvCount),
+        ]),
+        environment: z.record(z.string()).optional(),
+        cwd: z.string().optional(),
+        ...(includeTimeout && { timeout: z.unknown().optional() }),
+      })
+      .strict(),
+    options,
+    "sandbox command options",
+  ) as unknown as T;
+
+  if (Array.isArray(parsed.command) && !parsed.command[0]) {
+    throw new SandboxValidationError("command[0] must not be empty");
+  }
+  const argv =
+    typeof parsed.command === "string"
+      ? ["/bin/sh", "-c", parsed.command]
+      : parsed.command;
+  let argvBytes = 0;
+  argv.forEach((argument, index) => {
+    const context =
+      typeof parsed.command === "string" ? "command" : `command[${index}]`;
+    assertNoNul(argument, context);
+    assertValidUnicode(argument, context);
+    argvBytes += textEncoder.encode(argument).byteLength;
+  });
+  if (argvBytes > maxProcessArgvBytes) {
+    throw new SandboxValidationError(
+      `command must not exceed ${maxProcessArgvBytes} bytes`,
+    );
+  }
+
+  const entries = validateSandboxEnvironment(parsed.environment);
+
+  if (parsed.cwd !== undefined) {
+    assertNoNul(parsed.cwd, "cwd");
+    assertValidUnicode(parsed.cwd, "cwd");
+    if (textEncoder.encode(parsed.cwd).byteLength > maxProcessCwdBytes) {
+      throw new SandboxValidationError(
+        `cwd must not exceed ${maxProcessCwdBytes} bytes`,
+      );
+    }
+  }
+
+  const wireBytes = goJSONBytes({
+    argv,
+    ...(entries.length > 0 && { env: parsed.environment }),
+    ...(parsed.cwd !== undefined && parsed.cwd !== "" && { cwd: parsed.cwd }),
+  });
+  if (wireBytes > maxProcessWireBytes) {
+    throw new SandboxValidationError(
+      `command, environment, and cwd must not exceed ${maxProcessWireBytes} encoded bytes`,
+    );
+  }
+  return {
+    ...parsed,
+    command: [...argv],
+  } as Omit<T, "command"> & { command: string[] };
+};
+
+export const normalizeSandboxCommandOptions = (
+  command: SandboxCommand,
+  options: SandboxCommandOptions = {},
+): SandboxCommandOptions & { command: string[]; timeoutMs: number } => {
+  const parsed = normalizeProcessSpec({ ...options, command }, true);
+  return {
+    ...parsed,
+    timeoutMs:
+      parsed.timeout === undefined
+        ? defaultSandboxProcessTimeoutMs
+        : normalizeDurationMs(
+            parsed.timeout,
+            maxSandboxProcessTimeoutMs,
+            "timeout",
+          ),
+  };
+};
+
+export const exitCodesSchema = z.union([
+  z.literal("any"),
+  z.array(z.number().int()),
+]);
+
+/**
+ * Rejects keys a `$` does not take, and bad `exitCodes`.
+ */
+export const validateDollarOptions = (options: unknown): void => {
+  parseWithSchema(
+    z
+      .object({
+        id: z.string().optional(),
+        timeout: z.unknown(),
+        env: z.unknown(),
+        cwd: z.unknown(),
+        exitCodes: exitCodesSchema.optional(),
+        tools: z.unknown(),
+        shims: z.unknown(),
+        toolOptions: z.unknown(),
+      })
+      .strict(),
+    options,
+    "$ options",
+  );
+};
+
+export const normalizeSandboxProcessStartOptions = (
+  options: SandboxProcessStartOptions,
+): Omit<SandboxProcessStartOptions, "command"> & { command: string[] } =>
+  normalizeProcessSpec(options, false);
+
+export const normalizeSandboxProcessSignalOptions = (
+  options: SandboxProcessSignalOptions,
+): Required<SandboxProcessSignalOptions> => {
+  const parsed = parseWithSchema(
+    z
+      .object({
+        signal: z.number().int().min(1).max(64),
+        includeChildren: z.boolean().optional(),
+      })
+      .strict(),
+    options,
+    "sandbox process signal options",
+  );
+  return {
+    signal: parsed.signal,
+    includeChildren: parsed.includeChildren ?? true,
+  };
+};
+
+export const normalizeSandboxProcessWaitOptions = (
+  options: SandboxProcessWaitOptions = {},
+): { timeoutMs: number } => {
+  const parsed = parseWithSchema(
+    z.object({ timeout: z.unknown().optional() }).strict(),
+    options,
+    "sandbox process wait options",
+  );
+  return {
+    timeoutMs:
+      parsed.timeout === undefined
+        ? defaultSandboxProcessTimeoutMs
+        : normalizeDurationMs(
+            parsed.timeout,
+            maxSandboxProcessTimeoutMs,
+            "timeout",
+          ),
+  };
+};
+
+export const normalizeSandboxProcessOutputOptions = (
+  options: SandboxProcessOutputOptions = {},
+): { tailBytes: number } => {
+  const parsed = parseWithSchema(
+    z
+      .object({
+        tailBytes: z
+          .number()
+          .int()
+          .min(0)
+          .max(maxSandboxProcessTailBytes)
+          .optional(),
+      })
+      .strict(),
+    options,
+    "sandbox process output options",
+  );
+  return { tailBytes: parsed.tailBytes ?? 0 };
+};
+
+export const normalizeDurationMs = (
+  duration: unknown,
+  maximumMs: number,
+  context: string,
+): number => {
+  let milliseconds: number;
+  try {
+    milliseconds = durationToMs(duration, { name: context });
+  } catch (error) {
+    throw new SandboxValidationError(
+      error instanceof Error ? error.message : String(error),
+      { cause: error },
+    );
+  }
+  if (milliseconds > maximumMs) {
+    throw new SandboxValidationError(
+      `${context} must not exceed ${maximumMs} milliseconds`,
+    );
+  }
+  return milliseconds;
+};
+
+export const normalizeFileUploadOptions = (
+  options: SandboxFileUploadOptions,
+): SandboxFileUploadOptions => {
+  const parsed = parseWithSchema(
+    z
+      .object({
+        path: z.string().min(1),
+        data: z.unknown(),
+        mode: z.number().int().min(1).max(0o777).optional(),
+      })
+      .strict(),
+    options,
+    "sandbox file upload options",
+  );
+  validateFilePath(parsed.path);
+  return parsed as SandboxFileUploadOptions;
+};
+
+export const normalizeFileDownloadOptions = (
+  options: SandboxFileDownloadOptions,
+): SandboxFileDownloadOptions => {
+  const parsed = parseWithSchema(
+    z.object({ path: z.string().min(1) }).strict(),
+    options,
+    "sandbox file download options",
+  );
+  validateFilePath(parsed.path);
+  return parsed;
+};
+
+const validateFilePath = (path: string): void => {
+  assertNoNul(path, "path");
+  if (!path.startsWith("/")) {
+    throw new SandboxValidationError("path must be absolute");
+  }
+  if (textEncoder.encode(path).byteLength > maxProcessCwdBytes) {
+    throw new SandboxValidationError(
+      `path must not exceed ${maxProcessCwdBytes} bytes`,
+    );
+  }
+};
+
+export const decodeBase64 = (value: string, context: string): Uint8Array => {
+  if (
+    !/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(
+      value,
+    )
+  ) {
+    throw new SandboxValidationError(`${context} is not valid base64`);
+  }
+  try {
+    const binary = globalThis.atob(value);
+    const bytes = new Uint8Array(binary.length);
+    for (let index = 0; index < binary.length; index++) {
+      bytes[index] = binary.charCodeAt(index);
+    }
+    return bytes;
+  } catch (error) {
+    throw new SandboxValidationError(`${context} is not valid base64`, {
+      cause: error,
+    });
+  }
+};
+
+export const decodeUtf8 = (value: Uint8Array): string =>
+  new TextDecoder("utf-8", { fatal: false }).decode(value);
+
+export const encodeBase64 = (value: Uint8Array): string => {
+  let binary = "";
+  const chunkSize = 0x8000;
+  for (let offset = 0; offset < value.length; offset += chunkSize) {
+    binary += String.fromCharCode(
+      ...value.subarray(offset, offset + chunkSize),
+    );
+  }
+  return globalThis.btoa(binary);
+};
+
+/**
+ * Decode output data written with either encoding. Steps memoized before text
+ * output existed are always base64.
+ */
+export const decodeOutputData = (
+  value: string,
+  encoding: SandboxOutputEncoding,
+  context: string,
+): Uint8Array => {
+  if (encoding === "utf8") {
+    return new TextEncoder().encode(value);
+  }
+
+  return decodeBase64(value, context);
+};
+
+// A tail cut can start inside a multi-byte character; its leftover
+// continuation bytes (0b10xxxxxx) are not text.
+const dropLeadingContinuationBytes = (bytes: Uint8Array): Uint8Array => {
+  let start = 0;
+  while (start < 3 && start < bytes.length && (bytes[start]! & 0xc0) === 0x80) {
+    start++;
+  }
+
+  return bytes.subarray(start);
+};
+
+const jsonSize = (values: string[]): number => {
+  const encoder = new TextEncoder();
+
+  return values.reduce((sum, value) => {
+    return sum + encoder.encode(JSON.stringify(value)).byteLength;
+  }, 0);
+};
+
+/**
+ * Encode captured output for a step result: readable text when every value is
+ * valid UTF-8 and no larger as JSON than base64 would be (control characters
+ * escape to six bytes), otherwise base64 for all of them. `truncated[i]` marks
+ * values whose start was cut off by a tail truncation.
+ */
+export const encodeOutput = (
+  values: Uint8Array[],
+  { truncated = [] }: { truncated?: boolean[] } = {},
+): { encoding: SandboxOutputEncoding; values: string[] } => {
+  const base64 = values.map(encodeBase64);
+  const decoder = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
+
+  try {
+    const text = values.map((value, i) => {
+      return decoder.decode(
+        truncated[i] ? dropLeadingContinuationBytes(value) : value,
+      );
+    });
+    if (jsonSize(text) <= jsonSize(base64)) {
+      return { encoding: "utf8", values: text };
+    }
+  } catch {
+    // Not valid UTF-8, so base64 below.
+  }
+
+  return { encoding: "base64", values: base64 };
+};
+
+export const decodeOutputChunk = (value: unknown): SandboxOutputChunk => {
+  const chunk = parseWithSchema(
+    restOutputChunkSchema,
+    value,
+    "sandbox output chunk",
+  );
+  return {
+    stream: chunk.stream,
+    data: decodeOutputData(chunk.data, chunk.encoding, "sandbox output data"),
+    ...(chunk.at !== undefined && { at: chunk.at }),
+  };
+};

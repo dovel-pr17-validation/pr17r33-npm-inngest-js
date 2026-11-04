@@ -1,0 +1,48 @@
+{
+  "name": "@inngest/middleware-sentry",
+  "version": "1.0.0",
+  "description": "Sentry middleware for Inngest.",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "publishConfig": {
+    "registry": "https://registry.npmjs.org"
+  },
+  "scripts": {
+    "test": "vitest run",
+    "test:integration": "vitest run --config vitest.config.integration.ts",
+    "build": "tsc",
+    "postversion": "pnpm run build",
+    "release": "node ../../scripts/release/publish.js"
+  },
+  "files": [
+    "dist"
+  ],
+  "keywords": [
+    "inngest-middleware",
+    "inngest",
+    "middleware",
+    "sentry"
+  ],
+  "homepage": "https://github.com/inngest/inngest-js/tree/main/packages/middleware-sentry#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/inngest/inngest-js.git",
+    "directory": "packages/middleware-sentry"
+  },
+  "author": "Inngest Inc. <hello@inngest.com>",
+  "license": "Apache-2.0",
+  "devDependencies": {
+    "@inngest/test-harness": "workspace:*",
+    "@types/node": "^22.0.0",
+    "@sentry/core": "^8.8.0",
+    "@sentry/types": "^8.8.0",
+    "inngest": "^4.0.0",
+    "typescript": "~5.8.2",
+    "vitest": "^4.0.18"
+  },
+  "peerDependencies": {
+    "@sentry/core": ">=8.0.0",
+    "@sentry/types": ">=8.0.0",
+    "inngest": ">=4.0.0-alpha.6 <5.0.0"
+  }
+}

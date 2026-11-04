@@ -1,0 +1,15 @@
+{
+  "name": "inngest-elysiajs",
+  "version": "1.0.50",
+  "scripts": {
+    "dev": "bun run --watch src/index.ts"
+  },
+  "dependencies": {
+    "elysia": "^1.4.28",
+    "inngest": "^4.4.0"
+  },
+  "devDependencies": {
+    "bun-types": "latest"
+  },
+  "module": "src/index.js"
+}

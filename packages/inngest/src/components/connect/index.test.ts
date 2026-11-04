@@ -1,0 +1,217 @@
+import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
+import { envKeys } from "../../helpers/consts.ts";
+import type { Mode } from "../../helpers/env.ts";
+import { WorkerConnectRequestData } from "../../proto/src/components/connect/protobuf/connect.ts";
+import { Inngest } from "../Inngest.ts";
+import {
+  createLogger,
+  createMockStartResponse,
+  MockWebSocket,
+  setupCoreMocks,
+  teardownCoreMocks,
+} from "./strategies/core/test-helpers.ts";
+import { createStrategy } from "./strategies/index.ts";
+import { SameThreadStrategy } from "./strategies/sameThread/index.ts";
+import type { ConnectHandlerOptions } from "./types.ts";
+
+// ---------------------------------------------------------------------------
+// Setup / Teardown
+// ---------------------------------------------------------------------------
+
+beforeEach(() => {
+  setupCoreMocks();
+});
+
+afterEach(() => {
+  teardownCoreMocks();
+});
+
+// ---------------------------------------------------------------------------
+// Test helpers
+// ---------------------------------------------------------------------------
+
+const createTestOptions = (
+  opts: Partial<ConnectHandlerOptions> = {},
+): ConnectHandlerOptions => {
+  const inngest = new Inngest({ id: "test-app", isDev: true });
+  return {
+    apps: [{ client: inngest, functions: [] }],
+    ...opts,
+  };
+};
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+describe("connect maxWorkerConcurrency", () => {
+  const originalEnv = process.env;
+
+  beforeEach(() => {
+    process.env = { ...originalEnv };
+  });
+
+  afterEach(() => {
+    process.env = originalEnv;
+  });
+
+  describe("environment variable parsing", () => {
+    test("should parse positive integer from INNGEST_CONNECT_MAX_WORKER_CONCURRENCY", () => {
+      process.env[envKeys.InngestConnectMaxWorkerConcurrency] = "10";
+      expect(process.env[envKeys.InngestConnectMaxWorkerConcurrency]).toBe(
+        "10",
+      );
+    });
+
+    test("should handle various numeric string formats", () => {
+      const testCases = [
+        { input: "1", expected: 1 },
+        { input: "100", expected: 100 },
+        { input: "999", expected: 999 },
+      ];
+
+      for (const { input, expected } of testCases) {
+        process.env[envKeys.InngestConnectMaxWorkerConcurrency] = input;
+        const parsed = Number.parseInt(
+          process.env[envKeys.InngestConnectMaxWorkerConcurrency] as string,
+          10,
+        );
+        expect(parsed).toBe(expected);
+        expect(Number.isNaN(parsed)).toBe(false);
+        expect(parsed > 0).toBe(true);
+      }
+    });
+
+    test("should reject invalid values", () => {
+      const invalidCases = ["not-a-number", "abc", "", "-5", "0", "   "];
+
+      for (const input of invalidCases) {
+        process.env[envKeys.InngestConnectMaxWorkerConcurrency] = input;
+        const parsed = Number.parseInt(
+          process.env[envKeys.InngestConnectMaxWorkerConcurrency] as string,
+          10,
+        );
+        const isValid = !Number.isNaN(parsed) && parsed > 0;
+        expect(isValid).toBe(false);
+      }
+    });
+  });
+
+  describe("WorkerConnectRequestData message creation", () => {
+    test("should create message with maxWorkerConcurrency when provided", () => {
+      const msg = WorkerConnectRequestData.create({
+        connectionId: "test-connection",
+        instanceId: "test-instance",
+        sdkVersion: "v1.0.0",
+        sdkLanguage: "typescript",
+        framework: "connect",
+        workerManualReadinessAck: false,
+        maxWorkerConcurrency: 15,
+      });
+      expect(msg.maxWorkerConcurrency).toBe(15);
+    });
+
+    test("should create message without maxWorkerConcurrency when undefined", () => {
+      const msg = WorkerConnectRequestData.create({
+        connectionId: "test-connection",
+        instanceId: "test-instance",
+        sdkVersion: "v1.0.0",
+        sdkLanguage: "typescript",
+        framework: "connect",
+        workerManualReadinessAck: false,
+      });
+      expect(msg.maxWorkerConcurrency).toBeUndefined();
+    });
+  });
+
+  describe("ConnectHandlerOptions type", () => {
+    test("should accept maxWorkerConcurrency in options", () => {
+      const options: ConnectHandlerOptions = createTestOptions({
+        maxWorkerConcurrency: 20,
+      });
+      expect(options.maxWorkerConcurrency).toBe(20);
+    });
+
+    test("should allow undefined maxWorkerConcurrency", () => {
+      const options: ConnectHandlerOptions = createTestOptions();
+      expect(options.maxWorkerConcurrency).toBeUndefined();
+    });
+
+    test("explicit value should be a number", () => {
+      const options: ConnectHandlerOptions = createTestOptions({
+        maxWorkerConcurrency: 5,
+      });
+      expect(typeof options.maxWorkerConcurrency).toBe("number");
+    });
+  });
+
+  describe("precedence and defaults", () => {
+    test("explicit value takes precedence over environment variable", () => {
+      process.env[envKeys.InngestConnectMaxWorkerConcurrency] = "100";
+      const options = createTestOptions({ maxWorkerConcurrency: 50 });
+      expect(options.maxWorkerConcurrency).toBe(50);
+    });
+
+    test("environment variable is used when no explicit value provided", () => {
+      process.env[envKeys.InngestConnectMaxWorkerConcurrency] = "75";
+      const options = createTestOptions();
+      expect(options.maxWorkerConcurrency).toBeUndefined();
+      expect(process.env[envKeys.InngestConnectMaxWorkerConcurrency]).toBe(
+        "75",
+      );
+    });
+  });
+});
+
+describe("ConnectHandlerOptions gatewayUrl", () => {
+  test("should accept gatewayUrl in options", () => {
+    const options: ConnectHandlerOptions = createTestOptions({
+      gatewayUrl: "ws://localhost:8100",
+    });
+    expect(options.gatewayUrl).toBe("ws://localhost:8100");
+  });
+
+  test("should allow undefined gatewayUrl", () => {
+    const options: ConnectHandlerOptions = createTestOptions();
+    expect(options.gatewayUrl).toBeUndefined();
+  });
+});
+
+describe("createStrategy", () => {
+  const stubConfig = {
+    hashedSigningKey: undefined,
+    hashedFallbackKey: undefined,
+    internalLogger: createLogger(),
+    envName: undefined,
+    apiBaseUrl: undefined,
+    mode: "dev" as Mode,
+    connectionData: {
+      marshaledCapabilities: "",
+      manualReadinessAck: false,
+      apps: [],
+    },
+    requestHandlers: {},
+    options: createTestOptions(),
+  };
+
+  test("defaults to WorkerThreadStrategy when isolateExecution is not set", async () => {
+    const strategy = await createStrategy(stubConfig, createTestOptions());
+    expect(strategy).not.toBeInstanceOf(SameThreadStrategy);
+  });
+
+  test("defaults to WorkerThreadStrategy when isolateExecution is true", async () => {
+    const strategy = await createStrategy(
+      stubConfig,
+      createTestOptions({ isolateExecution: true }),
+    );
+    expect(strategy).not.toBeInstanceOf(SameThreadStrategy);
+  });
+
+  test("uses SameThreadStrategy when isolateExecution is false", async () => {
+    const strategy = await createStrategy(
+      stubConfig,
+      createTestOptions({ isolateExecution: false }),
+    );
+    expect(strategy).toBeInstanceOf(SameThreadStrategy);
+  });
+});

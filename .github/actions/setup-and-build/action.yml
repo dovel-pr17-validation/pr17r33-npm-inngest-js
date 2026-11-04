@@ -1,0 +1,56 @@
+name: "Setup and build inngest"
+description: "Sets up Node, installs dependencies, and builds the inngest package."
+inputs:
+  working-directory: # id of input
+    description: "The directory to run the action in."
+    required: false
+    default: "."
+  install-dependencies:
+    description: "Whether dependencies should be installed."
+    required: false
+    default: true
+  build:
+    description: "Whether the build step should be run."
+    required: false
+    default: true
+runs:
+  using: composite
+  steps:
+    - uses: pnpm/action-setup@v4
+      with:
+        run_install: false
+
+    - uses: actions/setup-node@v4
+      with:
+        # TODO (EXE-1981): Unpin this. We had to pin it due to networking
+        # issues.
+        node-version: "24.16.0"
+        cache: pnpm
+        registry-url: "https://registry.npmjs.org"
+
+    - uses: oven-sh/setup-bun@v2
+
+    # The sandbox-tool binary that shims put into sandboxes is built with the
+    # package.
+    - uses: actions/setup-go@v5
+      with:
+        go-version: "1.22"
+        cache: false
+
+    - name: Install dependencies
+      if: ${{ inputs.install-dependencies == 'true' }}
+      run: pnpm install --frozen-lockfile
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+
+    - name: Build test dependencies
+      if: ${{ inputs.install-dependencies == 'true' }}
+      run: pnpm run build
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}/packages/test
+
+    - name: Build
+      if: ${{ inputs.build == 'true' }}
+      run: pnpm run build
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}/packages/inngest

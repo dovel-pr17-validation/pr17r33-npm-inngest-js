@@ -1,0 +1,820 @@
+import type { fetch } from "cross-fetch";
+import { z } from "zod/v3";
+import { type ExecutionVersion, headerKeys } from "../helpers/consts.ts";
+import { getErrorMessage } from "../helpers/errors.ts";
+import { type Marker, markerKey } from "../helpers/marker.ts";
+import { fetchWithAuthFallback } from "../helpers/net.ts";
+import { hashSigningKey } from "../helpers/strings.ts";
+import {
+  type APIStepPayload,
+  err,
+  type MetadataTarget,
+  type OutgoingOp,
+  ok,
+  type Result,
+  type SendSignalResponse,
+} from "../types.ts";
+import { version } from "../version.ts";
+import {
+  type BatchResponse,
+  batchSchema,
+  type ErrorResponse,
+  errorSchema,
+  type StepsResponse,
+  stepSchema,
+} from "./schema.ts";
+
+type FetchT = typeof fetch;
+
+/**
+ * Thrown when the executor has already requeued the current run. Returning
+ * buffered ops after this would let the executor memoize them as canonical and
+ * chain the next dispatch off this dead invocation, producing duplicates.
+ */
+export class StaleDispatchError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "StaleDispatchError";
+  }
+
+  readonly [markerKey]: Marker = { kind: "StaleDispatchError" };
+}
+
+const realtimeSubscriptionTokenSchema = z.object({
+  jwt: z.string(),
+});
+
+const sendSignalSuccessResponseSchema = z.object({
+  data: z.object({
+    run_id: z.string().min(1),
+  }),
+});
+
+const checkpointNewRunResponseSchema = z.object({
+  data: z.object({
+    fn_id: z.string().min(1),
+    app_id: z.string().min(1),
+    run_id: z.string().min(1),
+    token: z.string().min(1).optional(),
+    realtime_token: z.string().min(1),
+  }),
+});
+
+export namespace InngestApi {
+  export interface Options {
+    baseUrl: () => string | undefined;
+    signingKey: () => string | undefined;
+    signingKeyFallback: () => string | undefined;
+    environment: () => string | null;
+    fetch: () => FetchT;
+  }
+
+  export interface Subscription {
+    topics: string[];
+    channel: string;
+  }
+
+  export interface PublishOptions extends Subscription {
+    runId?: string;
+  }
+
+  export interface SendSignalOptions {
+    signal: string;
+    data?: unknown;
+  }
+}
+
+export class InngestApi {
+  private readonly _signingKey: () => string | undefined;
+  private readonly _signingKeyFallback: () => string | undefined;
+  private readonly _apiBaseUrl: () => string | undefined;
+  private readonly _environment: () => string | null;
+  private readonly _fetch: () => FetchT;
+
+  constructor({
+    baseUrl,
+    signingKey,
+    signingKeyFallback,
+    environment,
+    fetch,
+  }: InngestApi.Options) {
+    this._apiBaseUrl = baseUrl;
+    this._signingKey = signingKey;
+    this._signingKeyFallback = signingKeyFallback;
+    this._environment = environment;
+    this._fetch = fetch;
+  }
+
+  private get apiBaseUrl(): string | undefined {
+    return this._apiBaseUrl();
+  }
+
+  private get signingKey(): string | undefined {
+    return this._signingKey();
+  }
+
+  private get signingKeyFallback(): string | undefined {
+    return this._signingKeyFallback();
+  }
+
+  private get apiHeaders(): Record<string, string> {
+    const environment = this._environment();
+    return {
+      [headerKeys.SdkVersion]: `inngest-js:v${version}`,
+      ...(environment ? { [headerKeys.Environment]: environment } : {}),
+    };
+  }
+
+  private get hashedKey(): string {
+    return hashSigningKey(this.signingKey);
+  }
+
+  private get hashedFallbackKey(): string | undefined {
+    if (!this.signingKeyFallback) {
+      return;
+    }
+
+    return hashSigningKey(this.signingKeyFallback);
+  }
+
+  private async getTargetUrl(path: string): Promise<URL> {
+    return new URL(path, this.apiBaseUrl);
+  }
+
+  private async req(
+    url: string | URL,
+    options?: RequestInit,
+  ): Promise<Result<Response, unknown>> {
+    const finalUrl: URL =
+      typeof url === "string" ? await this.getTargetUrl(url) : url;
+
+    try {
+      const res = await fetchWithAuthFallback({
+        authToken: this.hashedKey,
+        authTokenFallback: this.hashedFallbackKey,
+        fetch: this._fetch(),
+        url: finalUrl,
+        options: {
+          ...options,
+          headers: {
+            "Content-Type": "application/json",
+            ...this.apiHeaders,
+            ...options?.headers,
+          },
+        },
+      });
+
+      return ok(res);
+    } catch (error) {
+      return err(error);
+    }
+  }
+
+  async getRunSteps(
+    runId: string,
+  ): Promise<Result<StepsResponse, ErrorResponse>> {
+    const result = await this.req(
+      `/v0/runs/${encodeURIComponent(runId)}/actions`,
+    );
+    if (result.ok) {
+      const res = result.value;
+      const data: unknown = await res.json();
+
+      if (res.ok) {
+        return ok(stepSchema.parse(data));
+      }
+
+      return err(errorSchema.parse(data));
+    }
+
+    return err({
+      error: getErrorMessage(
+        result.error,
+        "Unknown error retrieving step data",
+      ),
+      status: 500,
+    });
+  }
+
+  async getRunBatch(
+    runId: string,
+  ): Promise<Result<BatchResponse, ErrorResponse>> {
+    const result = await this.req(
+      `/v0/runs/${encodeURIComponent(runId)}/batch`,
+    );
+    if (result.ok) {
+      const res = result.value;
+      const data: unknown = await res.json();
+
+      if (res.ok) {
+        return ok(batchSchema.parse(data));
+      }
+
+      return err(errorSchema.parse(data));
+    }
+
+    return err({
+      error: getErrorMessage(
+        result.error,
+        "Unknown error retrieving event batch",
+      ),
+      status: 500,
+    });
+  }
+
+  async publish(
+    publishOptions: InngestApi.PublishOptions,
+    // biome-ignore lint/suspicious/noExplicitAny: anything is acceptable
+    data: any,
+  ): Promise<Result<void, ErrorResponse>> {
+    // todo it may not be a "text/stream"
+    const isStream = data instanceof ReadableStream;
+
+    const url = await this.getTargetUrl("/v1/realtime/publish");
+    url.searchParams.set("channel", publishOptions.channel || "");
+    if (publishOptions.runId) {
+      url.searchParams.set("run_id", publishOptions.runId);
+    }
+    for (const topic of publishOptions.topics) {
+      url.searchParams.append("topic", topic);
+    }
+
+    const result = await this.req(url, {
+      body: isStream
+        ? data
+        : typeof data === "string"
+          ? data
+          : JSON.stringify(data),
+      method: "POST",
+      headers: {
+        "Content-Type": isStream ? "text/stream" : "application/json",
+      },
+      ...(isStream ? { duplex: "half" } : {}),
+    });
+    if (result.ok) {
+      const res = result.value;
+      if (!res.ok) {
+        throw new Error(
+          `Failed to publish event: ${res.status} ${res.statusText}`,
+        );
+      }
+
+      return ok<void>(undefined);
+    }
+
+    return err({
+      error: getErrorMessage(result.error, "Unknown error publishing event"),
+      status: 500,
+    });
+  }
+
+  /**
+   * Lists events by name, newest first, through the public events API
+   * (`GET /v1/events`). The Dev Server and Cloud both serve it.
+   * @param options The event name, the page size and the cursor (the
+   * `internalId` of the last event of the previous page).
+   */
+  async listEvents(options: {
+    name: string;
+    limit?: number;
+    cursor?: string;
+  }): Promise<
+    {
+      id?: string;
+      internalId: string;
+      name: string;
+      data: unknown;
+      ts?: number;
+    }[]
+  > {
+    const params = new URLSearchParams({ name: options.name });
+
+    if (options.limit) {
+      params.set("limit", String(options.limit));
+    }
+
+    if (options.cursor) {
+      params.set("cursor", options.cursor);
+    }
+
+    const result = await this.req(`/v1/events?${params.toString()}`);
+
+    if (!result.ok) {
+      throw new Error(
+        getErrorMessage(result.error, "Unknown error listing events"),
+      );
+    }
+
+    const res = result.value;
+
+    if (!res.ok) {
+      throw new Error(
+        `Listing events failed: ${res.status} ${res.statusText} - ${await res.text()}`,
+      );
+    }
+
+    const body = (await res.json()) as {
+      data?: {
+        id?: string;
+        internal_id: string;
+        name: string;
+        data: unknown;
+        ts?: number;
+      }[];
+    };
+
+    return (body.data ?? []).map((event) => {
+      return {
+        id: event.id,
+        internalId: event.internal_id,
+        name: event.name,
+        data: event.data,
+        ts: event.ts,
+      };
+    });
+  }
+
+  /**
+   * Runs an Insights SQL query. Rows come back as lists of values in the order
+   * of `columns`.
+   * @param query The Insights query.
+   */
+  async queryInsights(
+    query: string,
+  ): Promise<{ columns: string[]; rows: unknown[][] }> {
+    const result = await this.req("/v2/insights/query", {
+      method: "POST",
+      body: JSON.stringify({ query }),
+    });
+
+    if (!result.ok) {
+      throw new Error(
+        getErrorMessage(result.error, "Unknown error querying Insights"),
+      );
+    }
+
+    const res = result.value;
+    if (!res.ok) {
+      throw new Error(
+        `Insights query failed: ${res.status} ${res.statusText} - ${await res.text()}`,
+      );
+    }
+
+    const body = (await res.json()) as {
+      data?: {
+        columns?: { name: string }[];
+        rows?: { values: unknown[] }[];
+      };
+    };
+
+    return {
+      columns: (body.data?.columns ?? []).map((column) => {
+        return column.name;
+      }),
+      rows: (body.data?.rows ?? []).map((row) => {
+        return row.values;
+      }),
+    };
+  }
+
+  async sendSignal(
+    signalOptions: InngestApi.SendSignalOptions,
+    options?: {
+      headers?: Record<string, string>;
+    },
+  ): Promise<Result<SendSignalResponse, ErrorResponse>> {
+    const url = await this.getTargetUrl("/v1/signals");
+
+    const body = {
+      signal: signalOptions.signal,
+      data: signalOptions.data,
+    };
+
+    return fetchWithAuthFallback({
+      authToken: this.hashedKey,
+      authTokenFallback: this.hashedFallbackKey,
+      fetch: this._fetch(),
+      url,
+      options: {
+        method: "POST",
+        body: JSON.stringify(body),
+        headers: {
+          "Content-Type": "application/json",
+          ...this.apiHeaders,
+          ...options?.headers,
+        },
+      },
+    })
+      .then(async (res) => {
+        // A 404 is valid if the signal was not found.
+        if (res.status === 404) {
+          return ok<SendSignalResponse>({
+            runId: undefined,
+          });
+        }
+
+        // Save a clone of the response we can use to get the text of if we fail
+        // to parse the JSON.
+        const resClone = res.clone();
+
+        // JSON!
+        let json: unknown;
+        try {
+          json = await res.json();
+        } catch {
+          // res.json() failed so not a valid JSON response
+          return err({
+            error: `Failed to send signal: ${res.status} ${
+              res.statusText
+            } - ${await resClone.text()}`,
+            status: res.status,
+          });
+        }
+
+        // If we're not 2xx, something went wrong.
+        if (!res.ok) {
+          try {
+            return err(errorSchema.parse(json));
+          } catch {
+            // schema parse failed
+            return err({
+              error: `Failed to send signal: ${res.status} ${
+                res.statusText
+              } - ${await res.text()}`,
+              status: res.status,
+            });
+          }
+        }
+
+        // If we are 2xx, we should have a run_id.
+        const parseRes = sendSignalSuccessResponseSchema.safeParse(json);
+        if (!parseRes.success) {
+          return err({
+            error: `Successfully sent signal, but response parsing failed: ${
+              res.status
+            } ${res.statusText} - ${await resClone.text()}`,
+            status: res.status,
+          });
+        }
+
+        return ok({
+          runId: parseRes.data.data.run_id,
+        });
+      })
+      .catch((error) => {
+        // Catch-all if various things go wrong
+        return err({
+          error: getErrorMessage(error, "Unknown error sending signal"),
+          status: 500,
+        });
+      });
+  }
+
+  async getSubscriptionToken(
+    channel: string,
+    topics: string[],
+  ): Promise<string> {
+    const url = await this.getTargetUrl("/v1/realtime/token");
+
+    const body = topics.map((topic) => ({
+      channel,
+      name: topic,
+      kind: "run",
+    }));
+
+    return fetchWithAuthFallback({
+      authToken: this.hashedKey,
+      authTokenFallback: this.hashedFallbackKey,
+      fetch: this._fetch(),
+      url,
+      options: {
+        method: "POST",
+        body: JSON.stringify(body),
+        headers: {
+          "Content-Type": "application/json",
+          ...this.apiHeaders,
+        },
+      },
+    })
+      .then(async (res) => {
+        if (!res.ok) {
+          throw new Error(
+            `Failed to get subscription token: ${res.status} ${
+              res.statusText
+            } - ${await res.text()}`,
+          );
+        }
+
+        const data = realtimeSubscriptionTokenSchema.parse(await res.json());
+
+        return data.jwt;
+      })
+      .catch((error) => {
+        throw new Error(
+          getErrorMessage(error, "Unknown error getting subscription token"),
+        );
+      });
+  }
+
+  /**
+   * Cancels a run: `DELETE /v1/runs/{runId}`. A run that is gone answers 404,
+   * which is the error returned here, so the caller decides whether that
+   * matters. A request that never got an answer has status 0.
+   * @param runId The run to cancel.
+   */
+  async cancelRun(runId: string): Promise<Result<void, ErrorResponse>> {
+    const result = await this.req(`/v1/runs/${encodeURIComponent(runId)}`, {
+      method: "DELETE",
+    });
+
+    if (!result.ok) {
+      return err({
+        error: getErrorMessage(result.error, "Unknown error cancelling run"),
+        status: 0,
+      });
+    }
+
+    const res = result.value;
+    if (res.ok) {
+      return ok<void>(undefined);
+    }
+
+    return err({
+      error: `Failed to cancel run: ${res.status} ${res.statusText} - ${await res.text()}`,
+      status: res.status,
+    });
+  }
+
+  async updateMetadata(
+    args: {
+      target: MetadataTarget;
+      metadata: Array<{
+        kind: string;
+        op: string;
+        values: Record<string, unknown>;
+      }>;
+    },
+    options?: {
+      headers?: Record<string, string>;
+    },
+  ): Promise<Result<void, ErrorResponse>> {
+    const payload = { target: args.target, metadata: args.metadata };
+
+    const result = await this.req(
+      `/v1/runs/${encodeURIComponent(args.target.run_id)}/metadata`,
+      {
+        method: "POST",
+        body: JSON.stringify(payload),
+        headers: options?.headers,
+      },
+    );
+
+    if (!result.ok) {
+      return err({
+        error: getErrorMessage(result.error, "Unknown error updating metadata"),
+        status: 500,
+      });
+    }
+
+    const res = result.value;
+    if (res.ok) {
+      return ok<void>(undefined);
+    }
+
+    const resClone = res.clone();
+
+    let json: unknown;
+    try {
+      json = await res.json();
+    } catch {
+      return err({
+        error: `Failed to update metadata: ${res.status} ${
+          res.statusText
+        } - ${await resClone.text()}`,
+        status: res.status,
+      });
+    }
+
+    try {
+      return err(errorSchema.parse(json));
+    } catch {
+      return err({
+        error: `Failed to update metadata: ${res.status} ${res.statusText}`,
+        status: res.status,
+      });
+    }
+  }
+
+  /**
+   * Start a new run, optionally passing in a number of steps to initialize the
+   * run with.
+   */
+  async checkpointNewRun(args: {
+    runId: string;
+    event: APIStepPayload;
+    executionVersion: ExecutionVersion;
+    retries: number;
+    steps?: OutgoingOp[];
+  }): Promise<z.output<typeof checkpointNewRunResponseSchema>> {
+    const body = JSON.stringify({
+      run_id: args.runId,
+      event: args.event,
+      steps: args.steps,
+      ts: new Date().valueOf(),
+      request_version: args.executionVersion,
+      retries: args.retries,
+    });
+
+    const result = await this.req("/v1/checkpoint", {
+      method: "POST",
+      body,
+    });
+
+    if (!result.ok) {
+      throw new Error(
+        getErrorMessage(result.error, "Unknown error checkpointing new run"),
+      );
+    }
+
+    const res = result.value;
+    if (res.ok) {
+      const rawData: unknown = await res.json();
+      const data = checkpointNewRunResponseSchema.parse(rawData);
+
+      return data;
+    }
+
+    throw new Error(
+      `Failed to checkpoint new run: ${res.status} ${
+        res.statusText
+      } - ${await res.text()}`,
+    );
+  }
+
+  /**
+   * Checkpoint steps for a given sync run.
+   */
+  async checkpointSteps(args: {
+    runId: string;
+    fnId: string;
+    appId: string;
+    steps: OutgoingOp[];
+  }): Promise<void> {
+    const body = JSON.stringify({
+      fn_id: args.fnId,
+      app_id: args.appId,
+      run_id: args.runId,
+      steps: args.steps,
+      ts: new Date().valueOf(),
+    });
+
+    const result = await this.req(
+      `/v1/checkpoint/${encodeURIComponent(args.runId)}/steps`,
+      {
+        method: "POST",
+        body,
+      },
+    );
+
+    if (!result.ok) {
+      throw new Error(
+        getErrorMessage(result.error, "Unknown error checkpointing steps"),
+      );
+    }
+
+    const res = result.value;
+    if (!res.ok) {
+      throw new Error(
+        `Failed to checkpoint steps: ${res.status} ${
+          res.statusText
+        } - ${await res.text()}`,
+      );
+    }
+  }
+
+  /**
+   * Checkpoint steps for a given async run.
+   */
+  async checkpointStepsAsync(args: {
+    runId: string;
+    fnId: string;
+    queueItemId: string;
+    generationId: number | undefined;
+    requestId: string | undefined;
+    requestStartedAt: number | undefined;
+    steps: OutgoingOp[];
+  }): Promise<void> {
+    const body = JSON.stringify({
+      run_id: args.runId,
+      fn_id: args.fnId,
+      qi_id: args.queueItemId,
+      request_id: args.requestId,
+      generation_id: args.generationId,
+      request_started_at: args.requestStartedAt,
+      steps: args.steps,
+      ts: new Date().valueOf(),
+    });
+
+    const result = await this.req(
+      `/v1/checkpoint/${encodeURIComponent(args.runId)}/async`,
+      {
+        method: "POST",
+        body,
+      },
+    );
+
+    if (!result.ok) {
+      throw new Error(
+        getErrorMessage(result.error, "Unknown error checkpointing async"),
+      );
+    }
+
+    const res = result.value;
+    // 409 means the executor has already requeued. Halt rather than returning
+    // buffered ops, which would let the executor memoize them as canonical and
+    // chain the next dispatch off this dead invocation. See EXE-1552.
+    if (res.status === 409) {
+      throw new StaleDispatchError(
+        `Stale dispatch: checkpoint returned 409 (run ${args.runId})`,
+      );
+    }
+    if (!res.ok) {
+      throw new Error(
+        `Failed to checkpoint async: ${res.status} ${
+          res.statusText
+        } - ${await res.text()}`,
+      );
+    }
+  }
+
+  /**
+   * POST stream data to the realtime publish/tee endpoint, forwarding raw
+   * bytes to all subscribers via the broadcaster.
+   */
+  async checkpointStream(args: {
+    runId: string;
+    body: ReadableStream;
+  }): Promise<void> {
+    const url = await this.getTargetUrl(
+      `/v1/realtime/publish/tee?channel=${encodeURIComponent(args.runId)}`,
+    );
+
+    const res = await fetchWithAuthFallback({
+      authToken: this.hashedKey,
+      authTokenFallback: this.hashedFallbackKey,
+      fetch: this._fetch(),
+      url,
+      options: {
+        method: "POST",
+        body: args.body,
+        headers: {
+          "Content-Type": "application/octet-stream",
+          ...this.apiHeaders,
+        },
+        // Required for streaming request bodies
+        // @ts-expect-error duplex not in RequestInit types yet
+        duplex: "half",
+      },
+    });
+
+    if (!res.ok) {
+      throw new Error(
+        `Failed to stream checkpoint: ${res.status} ${
+          res.statusText
+        } - ${await res.text()}`,
+      );
+    }
+  }
+
+  /**
+   * Build the full SSE URL for a run's stream channel using the given token.
+   */
+  async getRealtimeStreamRedirect(token: string): Promise<{ url: string }> {
+    const sseUrl = await this.getTargetUrl("/v1/realtime/sse");
+    sseUrl.searchParams.set("token", token);
+
+    return { url: sseUrl.toString() };
+  }
+
+  /**
+   * Fetch the output of a completed run using a token.
+   *
+   * This uses token-based auth (not signing key) and is intended for use by
+   * proxy endpoints that fetch results on behalf of users.
+   *
+   * @param runId - The ID of the run to fetch output for
+   * @param token - The token used to authenticate the request
+   * @returns The raw Response from the API
+   */
+  async getRunOutput(runId: string, token: string): Promise<Response> {
+    const url = await this.getTargetUrl(
+      `/v1/http/runs/${encodeURIComponent(runId)}/output`,
+    );
+    url.searchParams.set("token", token);
+
+    return this._fetch()(url.toString(), {
+      method: "GET",
+      headers: { "Content-Type": "application/json" },
+    });
+  }
+}

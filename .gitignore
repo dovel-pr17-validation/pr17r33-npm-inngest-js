@@ -1,0 +1,18 @@
+# Node packages
+node_modules
+
+# Nix
+/.direnv/
+
+.idea
+.claude
+
+# Build output
+dist
+*.tgz
+examples/**/*/.env
+examples/**/*/dist
+
+CLAUDE.local.md
+
+.DS_Store
